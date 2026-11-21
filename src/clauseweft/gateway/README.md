@@ -28,7 +28,9 @@ curl -sS http://127.0.0.1:8765/v1/chat/completions \
   -d '{"model":"local-review","messages":[{"role":"user","content":"用一句话说明验收条件。"}],"max_tokens":128}'
 ```
 
-`GET /v1/models` 的 `data[].max_output_tokens` 是该端点的有效限制。工作台默认请求最多 1024 个输出 token，派发时允许网关采用更低的端点上限。直接 HTTP 客户端默认使用严格校验，需要同样行为时发送 `X-ClauseWeft-Token-Limit: clamp`。生成回执的 `gateway_metadata.max_output_tokens` 记录实际传给供应商的上限。对于 JSON 决策请求，`X-ClauseWeft-Output-Format: json` 启用 Ollama 的 `format: "json"` 和 `temperature=0`。Chat Completions 保留通用文本请求，平台在两条路径上都校验决策内容。
+`GET /v1/models` 的 `data[].max_output_tokens` 是该端点的有效限制。工作台默认请求最多 1024 个输出 token，派发时允许网关采用更低的端点上限。直接 HTTP 客户端默认使用严格校验，需要同样行为时发送 `X-ClauseWeft-Token-Limit: clamp`。生成回执的 `gateway_metadata.max_output_tokens` 记录实际传给供应商的上限。对于 JSON 决策请求，`X-ClauseWeft-Output-Format: json` 启用 Ollama 的 `format: "json"` 和 `temperature=0`。
+
+`POST /v1/chat/completions` 同时支持原生 `tools`、`tool_choice`、`response_format`（`text`、`json_object`、`json_schema`）、`tool` / `assistant(tool_calls)` 多轮工具消息，以及 `stream: true` 标准化 SSE 流式输出（`text/event-stream`，适配 Chat Completions SSE 与 Ollama NDJSON）。上游回执携带缓存命中或推理统计时，网关在 `usage` 中保留 `cached_tokens` 与 `reasoning_tokens`。
 
 若该端点可达，答复在 `choices[0].message.content`。配置入站令牌后，查询模型和生成时都需加 `-H "Authorization: Bearer $CLAUSEWEFT_GATEWAY_TOKEN"`。未设置令牌时只允许回环监听、本机 Host 与本机同源请求。公开健康检查不报告凭据或端点详情。
 

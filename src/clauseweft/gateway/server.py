@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from .config import load_config
 from .errors import GatewayError
-from .providers import invoke
+from .providers import invoke, invoke_stream, validate_messages, validate_response_format, validate_tools
 
 
 def unique_object(pairs):
@@ -126,13 +126,34 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except (ValueError, RecursionError):
             raise GatewayError(400, "invalid_json", "请求体必须是有效且无重复字段的 UTF-8 JSON") from None
 
+    def reply_stream(self, chunks):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("X-Request-ID", self.request_id)
+        self.send_header("Cache-Control", "no-store")
+        if self.response_etag is not None:
+            self.send_header("ETag", self.response_etag)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            for chunk in chunks:
+                line = "data: " + json.dumps(chunk, ensure_ascii=True, allow_nan=False) + "\n\n"
+                self.wfile.write(line.encode("utf-8"))
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except OSError:
+            pass
+        self.close_connection = True
+
     def chat(self):
         body = self.read_json()
-        allowed = {"model", "messages", "max_tokens", "stream"}
+        allowed = {"model", "messages", "max_tokens", "stream", "tools", "tool_choice", "response_format"}
         if not isinstance(body, dict) or body.keys() - allowed:
             raise GatewayError(400, "invalid_request", "请求对象含不支持的字段或格式错误")
-        if body.get("stream", False) is not False:
-            raise GatewayError(400, "unsupported_stream", "当前仅接受非流式调用")
+        stream = body.get("stream", False)
+        if type(stream) is not bool:
+            raise GatewayError(400, "invalid_request", "stream 须为布尔值")
         model = body.get("model")
         if not isinstance(model, str) or not model.strip():
             raise GatewayError(400, "invalid_request", "model 必须是端点 ID")
@@ -140,18 +161,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         endpoint = config.endpoints.get(model)
         if endpoint is None:
             raise GatewayError(404, "model_not_found", "请求的模型端点未配置")
+        tools, tool_choice = validate_tools(body.get("tools"), body.get("tool_choice"))
+        response_format = validate_response_format(body.get("response_format"))
         messages = body.get("messages")
-        if not isinstance(messages, list) or not 1 <= len(messages) <= 256:
-            raise GatewayError(400, "invalid_request", "messages 必须包含 1 到 256 条消息")
-        for message in messages:
-            if (not isinstance(message, dict) or set(message) != {"role", "content"}
-                    or message["role"] not in ("system", "user", "assistant")
-                    or not isinstance(message["content"], str) or not message["content"].strip()):
-                raise GatewayError(400, "invalid_request", "消息应仅包含受支持的 role 与非空文本 content")
-            try:
-                message["content"].encode("utf-8")
-            except UnicodeEncodeError:
-                raise GatewayError(400, "invalid_request", "消息包含无效的 Unicode 文本") from None
+        validate_messages(messages, allow_tools=bool(tools))
         limit = min(config.max_tokens, endpoint.max_tokens or config.max_tokens)
         tokens = body.get("max_tokens", limit)
         if type(tokens) is not int or tokens < 1:
@@ -159,8 +172,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if tokens > limit and self.headers.get("X-ClauseWeft-Token-Limit") != "clamp":
             raise GatewayError(400, "invalid_request", "max_tokens 超出配置范围")
         effective_tokens = min(tokens, limit)
-        result = invoke(config, model, messages, effective_tokens, self.request_id,
-                        json_decision=self.headers.get("X-ClauseWeft-Output-Format") == "json")
+        json_decision = self.headers.get("X-ClauseWeft-Output-Format") == "json"
+        if stream:
+            chunks = invoke_stream(
+                config, model, messages, effective_tokens, self.request_id,
+                json_decision=json_decision, tools=tools, tool_choice=tool_choice,
+                response_format=response_format,
+            )
+            self.reply_stream(chunks)
+            return None
+        result = invoke(
+            config, model, messages, effective_tokens, self.request_id,
+            json_decision=json_decision, tools=tools, tool_choice=tool_choice,
+            response_format=response_format,
+        )
         result.setdefault("gateway_metadata", {})["max_output_tokens"] = effective_tokens
         return result
 
@@ -199,7 +224,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except Exception:
             self.reply(500, error_payload(self.request_id, "internal_error", "网关内部错误"))
         else:
-            self.reply(200, body)
+            if body is not None:
+                self.reply(200, body)
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = handle_api
 

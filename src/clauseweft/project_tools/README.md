@@ -4,8 +4,8 @@
 
 ## 模块划分
 
-- `decisions.py`：定义工具白名单、参数与长度校验、单步/多步提示词与终止条件，以及查重后新建的顺序约束。
-- `approvals.py`：校验提议与运行版本，按负责人决定执行批准（写入回执与审计）、退回修改或拒绝。
+- `decisions.py`：定义工具白名单、风险分级（`TOOL_RISKS`：`search_requirements`/`search_reference` 为 `read_only`，`create_requirement` 为 `mutating`）、参数与长度校验、单步/多步提示词与终止条件，以及查重后新建的顺序约束。
+- `approvals.py`：校验提议与运行版本，按负责人决定执行批准（写入回执与审计）、退回修改或拒绝；当运行设置 `tool_approval_policy="auto_read_only"` 时，对授权仍然有效的只读检索工具自动执行并写入审计回执，写入类工具继续暂停等待人工确认。
 - `references.py`：在服务启动时按可信配置加载项目本地 UTF-8 JSON 资料索引，并执行关键词检索与数据范围控制。
 
 回归入口：`PYTHONPATH=src python3.11 -m unittest discover -s tests -p 'test_project_tools.py' -v`。

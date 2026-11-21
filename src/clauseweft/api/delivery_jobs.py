@@ -11,6 +11,28 @@ from .delivery_evidence import export_record, nodes, output
 from .http_contracts import encode, ident
 
 
+def format_test_feedback(report, round_num, max_rounds):
+    lines = [
+        f"自动验收测试未通过（第 {round_num}/{max_rounds} 轮，状态：{report.get('status')}）。"
+        "请根据以下真实测试失败证据修复代码并仅修改允许路径："
+    ]
+    if report.get("reason"):
+        lines.append(f"原因：{report['reason']}")
+    for case in report.get("cases", []):
+        if case.get("status") != "passed":
+            log = (case.get("log") or "").strip()[:800]
+            line = (
+                f"- 用例 {case.get('id')}（条款 {case.get('clause_id')}）："
+                f"状态={case.get('status')}，退出码={case.get('exit_code')}"
+            )
+            if case.get("reason"):
+                line += f"，原因={case['reason']}"
+            if log:
+                line += f"\n  输出日志：{log}"
+            lines.append(line)
+    return "\n".join(lines)[:3000]
+
+
 def job_event(
     app,
     db,
@@ -281,6 +303,13 @@ def work_once(delivery):
                 reason=reason,
                 state=state,
             )
+            if (
+                current
+                and kind == "execute-tests"
+                and state == "failed"
+                and result.get("status") != "needs_configuration"
+            ):
+                _maybe_auto_rework(delivery, db, rid, job_id, result, reason)
     except Exception as exc:
         detail = (
             redact(str(exc))
@@ -310,4 +339,50 @@ def work_once(delivery):
                 reason=detail[:500],
                 state="failed",
             )
+    return True
+
+
+def _maybe_auto_rework(delivery, db, rid, job_id, report, reason):
+    run_row = db.execute("SELECT body, status FROM runs WHERE run_id=?", (rid,)).fetchone()
+    if not run_row or run_row["status"] in ("cancelled", "paused"):
+        return False
+    body = json.loads(run_row["body"])
+    max_rounds = body.get("max_fix_rounds", 0)
+    if type(max_rounds) is not int or max_rounds < 1:
+        return False
+    used = db.execute(
+        "SELECT count(*) FROM events WHERE run_id=? AND kind='delivery_auto_rework'",
+        (rid,),
+    ).fetchone()[0]
+    if used >= max_rounds:
+        return False
+    run = delivery.app.run(rid)
+    run_nodes = nodes(run)
+    code_node = run_nodes.get("code")
+    if not code_node or code_node["state"] != "succeeded":
+        return False
+    budget = run["budget"]
+    if budget["limit_micros"] > 0 and budget["available_micros"] <= 0:
+        return False
+    feedback = format_test_feedback(report, used + 1, max_rounds)
+    delivery.app.runs.invalidate(rid, "code", feedback=feedback)
+    reviews.invalidate_candidate(db, rid)
+    details = {
+        "round": used + 1,
+        "max_fix_rounds": max_rounds,
+        "job_id": job_id,
+        "node_id": "code",
+        "reason": reason,
+        "feedback": feedback,
+    }
+    delivery.app.store.event(db, rid, "delivery_auto_rework", details)
+    audit.record(
+        db,
+        audit.SYSTEM,
+        "delivery.auto_rework",
+        f"runs/{rid}/rework",
+        run_id=rid,
+        project_id=run.get("project_id"),
+        details=details,
+    )
     return True

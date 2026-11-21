@@ -66,7 +66,7 @@ class Application:
         self.catalog = Catalog(self.store, cfg.get("gateways", {}))
         self.runs = Runs(
             self.store, self.catalog, scope_for=self.current_scope,
-            models_for=self.execution_models,
+            models_for=self.execution_models, after_finish=self._after_attempt_finish,
         )
         self.delivery = Delivery(
             self, cfg.get("repositories", {}), cfg.get("suites", {})
@@ -320,7 +320,9 @@ class Application:
             # and idempotency inside the committing transaction after preparation.
             prepared = None
             if method == "POST" and (
-                parts in (("runs",), ("agent-jobs",)) or len(parts) == 3 and parts[2] == "probes"
+                parts in (("runs",), ("agent-jobs",))
+                or (len(parts) == 3 and parts[2] == "probes")
+                or (len(parts) == 3 and parts[0] == "agent-jobs" and parts[2] == "tests")
             ):
                 with self.store.transaction() as db:
                     self.authorize(db, method, parts, query, body)
@@ -335,6 +337,8 @@ class Application:
                     }
                 elif parts == ("agent-jobs",):
                     prepared = self.agent_jobs.prepare(data)
+                elif parts[0] == "agent-jobs" and parts[2] == "tests":
+                    prepared = self.agent_jobs.prepare_test(parts[1], data)
                 elif parts[0] == "endpoints":
                     require_object(data, ("kind", "budget", "project_id", "workspace_id"))
                     kind = data.get("kind", "connectivity")
@@ -598,6 +602,12 @@ class Application:
         ):
             return self.grade(db, p[1], expected, data)
         raise Problem(404, "NOT_FOUND", "资源不存在")
+
+    def _after_attempt_finish(self, attempt_id):
+        with self.store.transaction() as db:
+            row = db.execute("SELECT run_id FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        if row:
+            project_tools.auto_approve(self, row["run_id"])
 
     def work(self, stop):
         while not stop.is_set():

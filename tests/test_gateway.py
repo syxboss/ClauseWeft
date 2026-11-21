@@ -30,14 +30,62 @@ class Provider(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if self.path == "/api/chat":
+            if payload.get("stream"):
+                chunks = [
+                    {"model": name, "done": False, "message": {"role": "assistant", "content": "hello "}},
+                    {"model": name, "done": True, "done_reason": "stop",
+                     "message": {"role": "assistant", "content": "stream"},
+                     "prompt_eval_count": 5, "eval_count": 3},
+                ]
+                body = ("\n".join(json.dumps(c) for c in chunks) + "\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             data = {"model": name, "done": True, "done_reason": "stop",
                     "message": {"role": "assistant", "content": "fixture reply"},
                     "prompt_eval_count": 5, "eval_count": 3}
+            if payload.get("tools"):
+                data["message"] = {
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"function": {"name": payload["tools"][0]["function"]["name"],
+                                                 "arguments": {"query": "refund"}}}],
+                }
         elif self.path == "/v1/chat/completions":
+            if payload.get("stream"):
+                chunks = [
+                    {"id": "upstream-stream", "object": "chat.completion.chunk", "model": name,
+                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hello "}, "finish_reason": None}]},
+                    {"id": "upstream-stream", "object": "chat.completion.chunk", "model": name,
+                     "choices": [{"index": 0, "delta": {"content": "stream"}, "finish_reason": "stop"}],
+                     "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8,
+                               "prompt_tokens_details": {"cached_tokens": 2},
+                               "completion_tokens_details": {"reasoning_tokens": 1}}},
+                ]
+                body = ("".join("data: " + json.dumps(c) + "\n\n" for c in chunks) + "data: [DONE]\n\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             data = {"id": "upstream-id", "model": name,
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": "fixture reply"},
                                  "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}
+            if payload.get("tools"):
+                data["choices"][0]["message"] = {
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{"id": "call_1", "type": "function",
+                                    "function": {"name": payload["tools"][0]["function"]["name"],
+                                                 "arguments": '{"query":"refund"}'}}],
+                }
+                data["choices"][0]["finish_reason"] = "tool_calls"
+            if payload["messages"][0].get("content") == "with details":
+                data["usage"]["prompt_tokens_details"] = {"cached_tokens": 3}
+                data["usage"]["completion_tokens_details"] = {"reasoning_tokens": 2}
         else:
             self.send_error(404)
             return
@@ -193,9 +241,82 @@ class GatewayContracts(unittest.TestCase):
     def test_rejected_requests_do_not_reach_upstream(self):
         self.assertEqual(self.chat("b", headers={})[0], 401)
         self.assertEqual(self.chat("absent")[0], 404)
-        for option in ({"stream": True}, {"base_url": "http://localhost"}, {"max_tokens": -1}):
+        for option in (
+            {"stream": "yes"},
+            {"base_url": "http://localhost"},
+            {"max_tokens": -1},
+            {"tool_choice": "auto"},
+            {"response_format": {"type": "xml"}},
+        ):
             self.assertEqual(self.chat("a", **option)[0], 400)
         self.assertTrue(self.upstream.calls.empty())
+
+    def test_native_tool_calling_response_format_and_token_details(self):
+        tools = [{"type": "function", "function": {
+            "name": "search_requirements",
+            "description": "Search requirements",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+        }}]
+        fmt = {"type": "json_schema", "json_schema": {"name": "plan", "schema": {"type": "object"}}}
+        for alias in ("a", "b"):
+            status, _, reply = self.chat(alias, tools=tools, tool_choice="auto", response_format=fmt)
+            self.assertEqual(status, 200, reply)
+            choice = reply["choices"][0]
+            self.assertEqual(choice["finish_reason"], "tool_calls")
+            call = choice["message"]["tool_calls"][0]
+            self.assertEqual(call["function"]["name"], "search_requirements")
+            self.assertEqual(json.loads(call["function"]["arguments"]), {"query": "refund"})
+            sent = self.upstream.calls.get(timeout=1)[2]
+            self.assertEqual(sent["tools"], tools)
+            if alias == "a":
+                self.assertEqual(sent["format"], {"type": "object"})
+            else:
+                self.assertEqual(sent["response_format"], fmt)
+                self.assertEqual(sent["tool_choice"], "auto")
+        # Multi-turn follow-up containing assistant tool_calls + tool result message
+        follow_messages = [
+            {"role": "user", "content": "find refund"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "search_requirements", "arguments": '{"query":"refund"}'}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": '{"items":[]}'},
+        ]
+        status, _, _ = self.chat("b", messages=follow_messages, tools=tools)
+        self.assertEqual(status, 200)
+        self.upstream.calls.get(timeout=1)
+        # Cached and reasoning token details
+        status, _, detailed = self.chat("b", messages=[{"role": "user", "content": "with details"}])
+        self.assertEqual(status, 200)
+        self.assertEqual(detailed["usage"]["cached_tokens"], 3)
+        self.assertEqual(detailed["usage"]["reasoning_tokens"], 2)
+        self.upstream.calls.get(timeout=1)
+
+    def test_streaming_sse_for_both_protocols(self):
+        for alias in ("a", "b"):
+            conn = HTTPConnection("127.0.0.1", self.port, timeout=8)
+            try:
+                body = json.dumps({
+                    "model": alias, "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 12, "stream": True,
+                }).encode()
+                conn.request("POST", "/v1/chat/completions", body,
+                             {"Content-Type": "application/json", **self.auth})
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                self.assertTrue(resp.getheader("Content-Type", "").startswith("text/event-stream"))
+                raw = resp.read().decode("utf-8")
+            finally:
+                conn.close()
+            self.upstream.calls.get(timeout=1)
+            events = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+            self.assertEqual(events[-1], "[DONE]")
+            parsed = [json.loads(item) for item in events[:-1]]
+            text = "".join(c["choices"][0]["delta"].get("content", "") for c in parsed if c.get("choices"))
+            self.assertEqual(text, "hello stream")
+            self.assertEqual(parsed[-1]["usage"]["total_tokens"], 8)
+            if alias == "b":
+                self.assertEqual(parsed[-1]["usage"]["cached_tokens"], 2)
+                self.assertEqual(parsed[-1]["usage"]["reasoning_tokens"], 1)
 
     def test_preflight_needs_no_port_or_credentials(self):
         config = Path(self.temp.name) / "gateway.json"

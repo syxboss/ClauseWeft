@@ -47,10 +47,12 @@ git apply --check /path/to/downloaded.patch
 
 | 方法与路径 | 用途 |
 |---|---|
-| `GET agent-jobs/options?project_id=ID` | 查看当前项目可选执行器与可授权外发的仓库 |
-| `POST agent-jobs` | 传入 `project_id, runner_id, repo_id, prompt`，可选 `base_sha`；对前次候选评审时改传 `review_of` |
+| `GET agent-jobs/options?project_id=ID` | 查看当前项目可选执行器、可授权外发的仓库及其配置的验收套件 |
+| `POST agent-jobs` | 传入 `project_id, runner_id, repo_id, prompt`，可选 `base_sha`、`review_of`（固定候选评审）、`continue_from`（基于前次候选继续修改并生成累计补丁）、`suite_id` 与 `max_fix_rounds`（0–3 轮自动测试修复循环） |
 | `GET agent-jobs?project_id=ID` | 按 `limit, cursor` 分页读取自己的任务 |
-| `GET agent-jobs/ID` | 读取状态、实际 SHA、事件、文本结果和补丁 |
+| `GET agent-jobs/ID` | 读取状态、实际 SHA、事件、文本结果、容器验收测试报告 `test_reports` 和补丁 |
+| `GET agent-jobs/ID/stream?after=0` | SSE 实时推送任务执行与测试事件流 |
+| `POST agent-jobs/ID/tests` | 对已完成代码任务的冻结候选在固定 Docker 镜像中运行登记的验收套件并持久化报告 |
 | `POST agent-jobs/ID/cancel` | 使用 `If-Match` 和空 JSON 对象取消该任务 |
 
 普通团队成员和其他管理员各自的外部任务受服务端访问控制。提供 Docker 服务和 CLI 的宿主、固定镜像、供应商，以及本机状态目录均属于部署的信任边界。[安全说明](../SECURITY.md)

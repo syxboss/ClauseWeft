@@ -20,11 +20,12 @@ from .requests import budget_limit, build_messages, normalize_task, route_snapsh
 class Runs:
     """Coordinate run lifecycle, workers and human decisions against one store and catalog."""
 
-    def __init__(self, store, catalog, scope_for=None, models_for=None):
+    def __init__(self, store, catalog, scope_for=None, models_for=None, after_finish=None):
         self.store = store
         self.catalog = catalog
         self.scope_for = scope_for
         self.models_for = models_for
+        self.after_finish = after_finish
 
     def _models(self, body):
         return self.models_for(body) if self.models_for is not None else self.catalog.list()
@@ -134,6 +135,8 @@ class Runs:
                 self.finish(attempt_id, error=err.code, receipt=err.receipt)
             else:
                 self.finish(attempt_id, *reply)
+                if self.after_finish is not None:
+                    self.after_finish(attempt_id)
             finally:
                 stop.set()
                 heartbeat.join()

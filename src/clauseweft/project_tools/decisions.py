@@ -11,6 +11,16 @@ TOOLS = {
         '{"title":"简明标题","description":"需求与验收条件","priority":"medium"}',
     ),
 }
+TOOL_RISKS = {
+    "search_requirements": "read_only",
+    "search_reference": "read_only",
+    "create_requirement": "mutating",
+}
+APPROVAL_POLICIES = ("always", "auto_read_only")
+
+
+def is_read_only(tool_id):
+    return TOOL_RISKS.get(tool_id) == "read_only"
 
 
 def checked_text(value, limit, name):
@@ -31,6 +41,9 @@ def proposal_prompt(tool_id):
 
 
 def validate_plan(data):
+    policy = data.get("tool_approval_policy", "always")
+    if not isinstance(policy, str) or policy not in APPROVAL_POLICIES:
+        raise ValueError("工具审批策略须为 always 或 auto_read_only")
     if "allowed_tools" not in data:
         if "max_tool_steps" in data or "requirement_query" in data:
             raise ValueError("多步工具设置需要 allowed_tools")

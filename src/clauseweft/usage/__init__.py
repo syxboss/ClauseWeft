@@ -30,7 +30,14 @@ def normalized_usage(value):
         or counts[0] + counts[1] != counts[2]
     ):
         return {"status": "invalid"}
-    return dict(status="reported", **dict(zip(fields, counts)))
+    result = dict(status="reported", **dict(zip(fields, counts)))
+    cached = value.get("cached_tokens")
+    if type(cached) is int and 0 <= cached <= counts[0]:
+        result["cached_tokens"] = cached
+    reasoning = value.get("reasoning_tokens")
+    if type(reasoning) is int and 0 <= reasoning <= counts[1]:
+        result["reasoning_tokens"] = reasoning
+    return result
 
 
 def counters():
@@ -39,6 +46,8 @@ def counters():
         input_tokens=0,
         output_tokens=0,
         total_tokens=0,
+        cached_tokens=0,
+        reasoning_tokens=0,
         known_input_tokens=0,
         known_output_tokens=0,
         known_total_tokens=0,
@@ -67,6 +76,10 @@ def add_attempt(target, attempt):
             target["known_" + name] += usage[source]
             if target[name] is not None:
                 target[name] += usage[source]
+        if type(usage.get("cached_tokens")) is int:
+            target["cached_tokens"] += usage["cached_tokens"]
+        if type(usage.get("reasoning_tokens")) is int:
+            target["reasoning_tokens"] += usage["reasoning_tokens"]
     else:
         target["missing_usage_calls"] += 1
         target["usage_complete"] = False

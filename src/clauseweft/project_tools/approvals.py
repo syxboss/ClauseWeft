@@ -1,6 +1,13 @@
 """Review proposed calls and commit approved effects with their run receipt."""
 
-from .decisions import TOOLS, arguments, checked_arguments, checked_text, read_decision, uses_reference
+import json
+
+from clauseweft import audit
+
+from .decisions import (
+    TOOL_RISKS, TOOLS, arguments, checked_arguments, checked_text, is_read_only,
+    read_decision, uses_reference,
+)
 from .references import search
 
 
@@ -12,17 +19,85 @@ def review(app, run):
         proposal = next(n for n in run["nodes"] if n["node_id"] == gate["dependencies"][0])
         value = read_decision(app.store.read_blob(proposal["artifact"]))
         tool = value["tool_id"]
-        return {"id": tool, "name": TOOLS[tool][0], "arguments": checked_arguments(tool, value["arguments"]),
+        return {"id": tool, "name": TOOLS[tool][0], "risk": TOOL_RISKS[tool],
+                "arguments": checked_arguments(tool, value["arguments"]),
                 "proposal_ref": proposal["artifact"], "gate_id": gate["node_id"], "node_id": proposal["node_id"]}
     proposal = next(node for node in run["nodes"] if node["node_id"] == "propose")
-    result = {"id": run["tool_id"], "name": TOOLS[run["tool_id"]][0], "proposal_ref": proposal["artifact"],
-              "gate_id": "confirm", "node_id": "propose"}
+    result = {"id": run["tool_id"], "name": TOOLS[run["tool_id"]][0], "risk": TOOL_RISKS[run["tool_id"]],
+              "proposal_ref": proposal["artifact"], "gate_id": "confirm", "node_id": "propose"}
     if proposal["artifact"]:
         try:
             result["arguments"] = arguments(run["tool_id"], app.store.read_blob(proposal["artifact"]))
         except (ValueError, OSError, RuntimeError) as exc:
             result["error"] = str(exc)
     return result
+
+
+def _execute_tool(app, db, run, project, actor, tool, args, dynamic, source):
+    if tool == "create_requirement":
+        existing = None
+        if dynamic:
+            records = app.platform.list(db, "requirements", {
+                "project_id": project["id"], "workspace_id": project["workspace_id"]}, actor)
+            query = run.get("requirement_query")
+            existing = next((item for item in records if (
+                query.casefold() in (item["title"] + "\n" + item["description"]).casefold()
+                if query else item["title"].casefold() == args["title"].casefold())), None)
+        item = existing or app.platform.save(db, "requirements", dict(
+            args, project_id=project["id"], workspace_id=project["workspace_id"]))
+        output = {key: item[key] for key in ("id", "title", "description", "priority", "revision")}
+        if dynamic:
+            output["disposition"] = "existing" if existing else "created"
+        return output
+    if tool == "search_requirements":
+        records = app.platform.list(db, "requirements", {
+            "project_id": project["id"], "workspace_id": project["workspace_id"]}, actor)
+        return {"query": args["query"], "items": search(
+            (dict(item, text=item["description"]) for item in records), args["query"])}
+    return {"source": source["name"], "source_sha256": source["digest"],
+            "query": args["query"], "items": search(source["docs"].values(), args["query"])}
+
+
+def auto_approve(app, run_id):
+    """Automatically execute a pending read-only tool gate when policy allows."""
+    with app.store.transaction() as db:
+        row = db.execute("SELECT body, status FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if not row or row["status"] != "needs_input":
+            return False
+        body = json.loads(row["body"])
+        if body.get("mode") != "tool" or body.get("tool_approval_policy") != "auto_read_only":
+            return False
+        run = app.platform.enrich_run(db, app.runs.get(run_id))
+        evidence = review(app, run)
+        if (not evidence or "error" in evidence or not is_read_only(evidence["id"])
+                or not any(n["state"] == "needs_input" and n["node_id"] == evidence["gate_id"]
+                           for n in run["nodes"])):
+            return False
+        creator = run.get("created_by")
+        try:
+            actor = app.platform.public_actor(db, {"id": creator} if creator else app.actor())
+            project = app.platform.authorize_project(db, run["project_id"], actor)
+        except Exception:
+            return False
+        if project["status"] != "active" or not app.execution_authorized(body, actor):
+            return False
+        source = app.references.get(project["id"])
+        if uses_reference(run) and (not source or source["digest"] != run.get("reference_digest")):
+            return False
+        tool = evidence["id"]
+        args = evidence["arguments"]
+        dynamic = "allowed_tools" in run
+        details = dict(tool_id=tool, proposal_ref=evidence["proposal_ref"], node_id=evidence["gate_id"],
+                       actor=actor["id"], project_id=project["id"],
+                       reason="只读工具按分级策略自动执行", auto_approved=True)
+        output = _execute_tool(app, db, run, project, actor, tool, args, dynamic, source)
+        receipt = dict(details, arguments=args, result=output)
+        app.store.event(db, run_id, "tool_auto_approved", details)
+        app.store.event(db, run_id, "tool_executed", details)
+        audit.record(db, audit.SYSTEM, "tool.auto_approved", f"runs/{run_id}/gates/{evidence['gate_id']}",
+                     run_id=run_id, project_id=project["id"], details=details)
+        app.runs.gate(run_id, evidence["gate_id"], receipt)
+        return True
 
 
 def decide(app, db, run, data):
@@ -64,28 +139,7 @@ def decide(app, db, run, data):
     if uses_reference(run) and (not source or source["digest"] != run.get("reference_digest")):
         raise RuntimeError("项目资料源已变更，请重新发起工具任务")
     args = evidence["arguments"]
-    if tool == "create_requirement":
-        existing = None
-        if dynamic:
-            records = app.platform.list(db, "requirements", {
-                "project_id": project["id"], "workspace_id": project["workspace_id"]}, actor)
-            query = run.get("requirement_query")
-            existing = next((item for item in records if (
-                query.casefold() in (item["title"] + "\n" + item["description"]).casefold()
-                if query else item["title"].casefold() == args["title"].casefold())), None)
-        item = existing or app.platform.save(db, "requirements", dict(
-            args, project_id=project["id"], workspace_id=project["workspace_id"]))
-        output = {key: item[key] for key in ("id", "title", "description", "priority", "revision")}
-        if dynamic:
-            output["disposition"] = "existing" if existing else "created"
-    elif tool == "search_requirements":
-        records = app.platform.list(db, "requirements", {
-            "project_id": project["id"], "workspace_id": project["workspace_id"]}, actor)
-        output = {"query": args["query"], "items": search(
-            (dict(item, text=item["description"]) for item in records), args["query"])}
-    else:
-        output = {"source": source["name"], "source_sha256": source["digest"],
-                  "query": args["query"], "items": search(source["docs"].values(), args["query"])}
+    output = _execute_tool(app, db, run, project, actor, tool, args, dynamic, source)
     receipt = dict(details, arguments=args, result=output)
     app.store.event(db, rid, "tool_executed", details)
     return app.runs.gate(rid, evidence["gate_id"], receipt)
