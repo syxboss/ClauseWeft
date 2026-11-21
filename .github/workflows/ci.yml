@@ -1,0 +1,64 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Prepare pinned agent CLIs for loopback protocol tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/agent-clis"
+          cp examples/agent-image/package.json examples/agent-image/package-lock.json "$RUNNER_TEMP/agent-clis/"
+          cd "$RUNNER_TEMP/agent-clis"
+          npm audit --omit=dev --audit-level=high
+          npm ci --omit=dev --ignore-scripts --no-fund --no-audit
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          ./node_modules/.bin/claude --version
+          ./node_modules/.bin/dsh --version
+          echo "CLAUSEWEFT_TEST_CLAUDE=$RUNNER_TEMP/agent-clis/node_modules/.bin/claude" >> "$GITHUB_ENV"
+          echo "CLAUSEWEFT_TEST_DSH=$RUNNER_TEMP/agent-clis/node_modules/.bin/dsh" >> "$GITHUB_ENV"
+      - name: Prepare Python image for container tests
+        run: |
+          docker pull python:3.11-slim
+          docker image inspect --format 'CLAUSEWEFT_TEST_IMAGE={{.Id}}' python:3.11-slim >> "$GITHUB_ENV"
+      - name: Build the locked agent image for installed CLI smoke tests
+        if: matrix.python == '3.11'
+        run: |
+          docker build -t clauseweft-agent-ci:local examples/agent-image
+          docker image inspect --format 'CLAUSEWEFT_TEST_AGENT_IMAGE={{.Id}}' clauseweft-agent-ci:local >> "$GITHUB_ENV"
+      - name: Prepare Chromium for the personal workbench end-to-end test
+        if: matrix.python == '3.11'
+        run: |
+          python -m pip install playwright==1.59.0
+          python -m playwright install --with-deps chromium
+          echo "CLAUSEWEFT_TEST_BROWSER=chromium" >> "$GITHUB_ENV"
+      - name: Run all tests with Docker
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v
+      - name: Check release inputs for private state and credentials
+        run: python scripts/check_release.py --checkout
+      - name: Check source distribution entry point
+        run: python scripts/check_distribution.py source
+      - name: Build sdist and wheel and verify installed commands
+        run: |
+          python -m pip install build
+          python -m build
+          python scripts/check_release.py dist/*.tar.gz dist/*.whl
+          python -m venv "$RUNNER_TEMP/installed"
+          "$RUNNER_TEMP/installed/bin/python" -m pip install --no-index dist/*.whl
+          "$RUNNER_TEMP/installed/bin/python" scripts/check_distribution.py installed

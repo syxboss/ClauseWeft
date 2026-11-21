@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clauseweft"
+version = "0.0.1"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "ClauseWeft contributors"}]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Quality Assurance",
+]
+description = "ClauseWeft — Local-first personal AI engineering workbench with multi-model orchestration, external agents, and verifiable delivery"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/syxboss/ClauseWeft"
+Repository = "https://github.com/syxboss/ClauseWeft"
+Issues = "https://github.com/syxboss/ClauseWeft/issues"
+
+[project.scripts]
+clauseweft = "clauseweft.cli:main"
+clauseweft-gateway = "clauseweft.gateway.server:main"
+
+[project.optional-dependencies]
+executable = ["pyinstaller==6.22.3"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["clauseweft*"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.package-data]
+"clauseweft.api.web" = ["*.html", "scripts/*.js", "styles/*.css"]
+"clauseweft.gateway" = ["LICENSE", "*.json", "Dockerfile", ".dockerignore"]

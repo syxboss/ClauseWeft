@@ -1,0 +1,6 @@
+*
+!*.py
+!Dockerfile
+!example.json
+!container.example.json
+!LICENSE

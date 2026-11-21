@@ -1,0 +1,11 @@
+{
+  "workspace_id": "local",
+  "data_scope": "local_only",
+  "gateways": {
+    "local": {
+      "url": "http://127.0.0.1:8765"
+    }
+  },
+  "repositories": {},
+  "suites": {}
+}

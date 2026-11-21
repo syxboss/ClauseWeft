@@ -1,0 +1,16 @@
+{
+  "timeout_seconds": 60,
+  "max_concurrency": 4,
+  "max_request_bytes": 262144,
+  "max_response_bytes": 2097152,
+  "max_tokens": 1024,
+  "endpoints": [
+    {
+      "id": "local-review",
+      "protocol": "ollama",
+      "base_url": "http://host.docker.internal:11434",
+      "model": "qwen2.5:7b",
+      "allow_insecure_http": true
+    }
+  ]
+}

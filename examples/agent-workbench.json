@@ -1,0 +1,26 @@
+{
+  "data_scope": "public",
+  "agent_runners": {
+    "claude-code": {
+      "kind": "claude",
+      "image": "sha256:<docker image inspect 返回的 64 位十六进制摘要>",
+      "executable": "/usr/local/bin/claude",
+      "token_env": "PERSONAL_CLAUDE_KEY",
+      "timeout_seconds": 180
+    },
+    "deepseek-review": {
+      "kind": "deepseek",
+      "image": "sha256:<docker image inspect 返回的 64 位十六进制摘要>",
+      "executable": "/usr/local/bin/dsh",
+      "token_env": "PERSONAL_DEEPSEEK_KEY",
+      "timeout_seconds": 180
+    }
+  },
+  "repositories": {
+    "my-repo": {
+      "path": "/absolute/path/to/my-git-repository",
+      "allowlist": ["src", "tests"],
+      "data_scope": "public"
+    }
+  }
+}

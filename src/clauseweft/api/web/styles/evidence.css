@@ -1,0 +1,125 @@
+.skill-selection {
+  margin: 20px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.skill-selection legend {
+  padding: 0 5px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.skill-selection .check {
+  align-items: flex-start;
+  margin: 9px 0;
+}
+.skill-selection .check small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+}
+.context-skills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 14px 0;
+}
+.context-messages {
+  margin-top: 20px;
+}
+.context-message {
+  margin: 18px 0;
+}
+.checkpoint-nodes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+}
+.checkpoint-nodes > div {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.checkpoint-nodes small {
+  color: var(--muted);
+}
+.audit-filters {
+  margin-bottom: 22px;
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.audit-filters .field-grid {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+.audit-verification {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  margin-bottom: 20px;
+  padding: 16px 20px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.audit-verification p {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.audit-verification.verified {
+  border-color: var(--line);
+  background: var(--success-soft);
+}
+.audit-verification.invalid {
+  border-color: var(--line);
+  background: var(--danger-soft);
+}
+.badge.audit-succeeded {
+  color: var(--green);
+  background: var(--success-soft);
+}
+.badge.audit-denied,
+.badge.audit-failed {
+  color: var(--red);
+  background: var(--danger-soft);
+}
+.audit-actor {
+  display: block;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  white-space: normal;
+}
+.audit-resource {
+  min-width: 180px;
+  max-width: 240px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.audit-snapshots {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 20px;
+}
+@media (max-width: 700px) {
+.audit-snapshots {
+    grid-template-columns: minmax(0, 1fr);
+  }
+.audit-verification {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+.page-heading {
+    flex-wrap: wrap;
+  }
+.page-heading > div:first-child {
+    min-width: 180px;
+    flex: 1;
+  }
+}

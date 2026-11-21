@@ -1,0 +1,10 @@
+include LICENSE README.md README.zh-CN.md CONTRIBUTING.md AGENTS.md SECURITY.md Dockerfile .dockerignore
+include .github/workflows/ci.yml
+recursive-include docs *.md *.webp
+recursive-include examples *.json
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include src/clauseweft *.md
+include examples/agent-image/Dockerfile examples/agent-image/.dockerignore
+include examples/agent-image/package.json examples/agent-image/package-lock.json
+prune examples/agent-image/node_modules

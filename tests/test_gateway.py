@@ -1,0 +1,255 @@
+"""Black-box gateway contracts with two local HTTP provider fixtures."""
+
+from contextlib import contextmanager
+import hashlib
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import queue
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from urllib.parse import urlsplit
+
+
+class Provider(BaseHTTPRequestHandler):
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.calls.put((self.path, self.headers.get("Authorization"), payload))
+        name = payload["model"]
+        if name == "delayed":
+            self.server.started.set()
+            self.server.release.wait(4)
+        if name == "redirect":
+            self.send_response(307)
+            self.send_header("Location", "/unexpected")
+            self.end_headers()
+            return
+        if self.path == "/api/chat":
+            data = {"model": name, "done": True, "done_reason": "stop",
+                    "message": {"role": "assistant", "content": "fixture reply"},
+                    "prompt_eval_count": 5, "eval_count": 3}
+        elif self.path == "/v1/chat/completions":
+            data = {"id": "upstream-id", "model": name,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "fixture reply"},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}
+        else:
+            self.send_error(404)
+            return
+        if payload["messages"][0]["content"] == "no usage":
+            data.pop("usage", None)
+        if payload["messages"][0]["content"] == "inconsistent usage":
+            data["usage"]["total_tokens"] = 0
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("X-Request-ID", "upstream-request")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+@contextmanager
+def gateway(config, directory, with_token=True):
+    path = Path(directory) / "gateway.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    env = dict(os.environ)
+    # Only synthetic fixture values go into the child.
+    for key in ("CLAUSEWEFT_GATEWAY_TOKEN", "FIXTURE_GATEWAY_TOKEN", "FIXTURE_PROVIDER_TOKEN"):
+        env.pop(key, None)
+    if with_token:
+        env["FIXTURE_GATEWAY_TOKEN"] = "client-fixture-token"
+    env["FIXTURE_PROVIDER_TOKEN"] = "provider-fixture-token"
+    source = Path(__file__).resolve().parents[1] / "src"
+    if source.is_dir():
+        env["PYTHONPATH"] = str(source)
+    command = ([env["TEST_GATEWAY_BINARY"]] if env.get("TEST_GATEWAY_BINARY")
+               else [sys.executable, "-m", "clauseweft.gateway"])
+    process = subprocess.Popen([*command, "--config", str(path), "--port", "0"],
+                               cwd=directory, env=env, text=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        line = process.stdout.readline()
+        if not line:
+            raise RuntimeError("Gateway startup failed: " + process.stderr.read())
+        yield urlsplit(line.strip().split()[-1]).port
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+
+def request(port, path, body=None, headers=None):
+    connection = HTTPConnection("127.0.0.1", port, timeout=8)
+    payload = json.dumps(body).encode() if body is not None else None
+    try:
+        connection.request("POST" if body is not None else "GET", path, payload,
+                           {"Content-Type": "application/json", **(headers or {})})
+        response = connection.getresponse()
+        return response.status, dict(response.getheaders()), json.loads(response.read())
+    finally:
+        connection.close()
+
+
+class GatewayContracts(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temp.cleanup)
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+        cls.addClassCleanup(upstream.server_close)
+        cls.upstream = upstream
+        upstream.calls = queue.Queue()
+        upstream.started, upstream.release = threading.Event(), threading.Event()
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        cls.addClassCleanup(upstream.shutdown)
+        base = f"http://127.0.0.1:{upstream.server_port}"
+        config = {
+            "token_env": "FIXTURE_GATEWAY_TOKEN", "max_concurrency": 1, "timeout_seconds": 5,
+            "endpoints": [
+                {"id": "a", "model": "provider-a", "protocol": "ollama", "base_url": base},
+                *[{"id": key, "model": name, "protocol": "chat_completions",
+                   "base_url": base + "/v1", "api_key_env": "FIXTURE_PROVIDER_TOKEN"}
+                  for key, name in (("b", "provider-b"), ("slow", "delayed"), ("move", "redirect"))],
+            ],
+        }
+        service = gateway(config, cls.temp.name)
+        cls.port = service.__enter__()
+        cls.addClassCleanup(service.__exit__, None, None, None)
+        cls.auth = {"Authorization": "Bearer client-fixture-token"}
+
+    def chat(self, name, *, headers=None, **extra):
+        return request(self.port, "/v1/chat/completions",
+                       {"model": name, "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 12, **extra}, self.auth if headers is None else headers)
+
+    def test_health_catalog_and_revision_guard(self):
+        self.assertEqual(request(self.port, "/healthz")[0], 200)
+        self.assertEqual(request(self.port, "/v1/models")[0], 401)
+        status, headers, catalog = request(self.port, "/v1/models", headers=self.auth)
+        self.assertEqual(status, 200)
+        self.assertEqual({model["id"] for model in catalog["data"]}, {"a", "b", "slow", "move"})
+        self.assertNotIn("base_url", json.dumps(catalog))
+        self.assertRegex(headers["ETag"], r'^"[0-9a-f]{64}"$')
+        self.assertEqual(self.chat("a", headers={**self.auth, "If-Match": '"old"'})[0], 412)
+        self.assertTrue(self.upstream.calls.empty())
+
+    def test_both_adapters_and_credential_separation(self):
+        _, catalog_headers, _ = request(self.port, "/v1/models", headers=self.auth)
+        for name, path, auth in (("a", "/api/chat", None), ("b", "/v1/chat/completions", "Bearer provider-fixture-token")):
+            with self.subTest(alias=name):
+                status, headers, reply = self.chat(name, headers={**self.auth, "If-Match": catalog_headers["ETag"]})
+                self.assertEqual(status, 200, reply)
+                self.assertTrue(headers["X-Request-ID"])
+                self.assertEqual(reply["model"], name)
+                self.assertEqual(reply["choices"][0]["message"]["content"], "fixture reply")
+                self.assertEqual(reply["usage"]["total_tokens"], 8)
+                metadata = reply["gateway_metadata"]
+                self.assertEqual(metadata["upstream_model"], "provider-" + name)
+                self.assertEqual(metadata["upstream_request_id"], "upstream-request")
+                if name == "b":
+                    self.assertEqual(metadata["upstream_completion_id"], "upstream-id")
+                actual_path, actual_auth, sent = self.upstream.calls.get(timeout=1)
+                self.assertEqual((actual_path, actual_auth), (path, auth))
+                self.assertEqual(sent["model"], "provider-" + name)
+                self.assertIs(sent["stream"], False)
+                self.assertEqual(sent.get("options", {}).get("num_predict", sent.get("max_tokens")), 12)
+
+    def test_token_limit_negotiation_and_ollama_json_format(self):
+        headers = {**self.auth, "X-ClauseWeft-Token-Limit": "clamp", "X-ClauseWeft-Output-Format": "json"}
+        _, _, models = request(self.port, "/v1/models", headers=self.auth)
+        limits = {m["id"]: m["max_output_tokens"] for m in models["data"]}
+        self.assertEqual(self.chat("a", max_tokens=limits["a"] + 1)[0], 400)
+        self.assertTrue(self.upstream.calls.empty())
+        for alias in ("a", "b"):
+            limit = limits[alias]
+            status, _, reply = self.chat(alias, max_tokens=limit + 1, headers=headers)
+            self.assertEqual(status, 200, reply)
+            self.assertEqual(reply["gateway_metadata"]["max_output_tokens"], limit)
+            sent = self.upstream.calls.get(timeout=1)[2]
+            if alias == "a":
+                self.assertEqual(sent["format"], "json")
+                self.assertEqual(sent["options"]["temperature"], 0)
+                self.assertEqual(sent["options"]["num_predict"], limit)
+            else:
+                self.assertNotIn("response_format", sent)
+                self.assertNotIn("format", sent)
+                self.assertEqual(sent["max_tokens"], limit)
+
+    def test_missing_or_inconsistent_usage_remains_unknown(self):
+        for content in ("no usage", "inconsistent usage"):
+            status, _, reply = self.chat("b", messages=[{"role": "user", "content": content}])
+            self.assertEqual(status, 200)
+            self.assertNotIn("usage", reply)
+            self.assertEqual(self.upstream.calls.get(timeout=1)[2]["model"], "provider-b")
+
+    def test_rejected_requests_do_not_reach_upstream(self):
+        self.assertEqual(self.chat("b", headers={})[0], 401)
+        self.assertEqual(self.chat("absent")[0], 404)
+        for option in ({"stream": True}, {"base_url": "http://localhost"}, {"max_tokens": -1}):
+            self.assertEqual(self.chat("a", **option)[0], 400)
+        self.assertTrue(self.upstream.calls.empty())
+
+    def test_preflight_needs_no_port_or_credentials(self):
+        config = Path(self.temp.name) / "gateway.json"
+        binary = os.environ.get("TEST_GATEWAY_BINARY")
+        command = [binary] if binary else [sys.executable, "-m", "clauseweft.gateway"]
+        env = os.environ.copy()
+        env.pop("FIXTURE_GATEWAY_TOKEN", None)
+        args = ["--check-config", "--port", str(self.port), "--config"]
+        result = subprocess.run(command + args + [str(config)], capture_output=True,
+                                text=True, env=env, check=True, timeout=10)
+        expected = hashlib.sha256(config.read_bytes()).hexdigest()
+        self.assertEqual(json.loads(result.stdout), {"status": "valid", "revision": expected,
+                                                    "endpoint_count": 4})
+        self.assertEqual(request(self.port, "/v1/models", headers=self.auth)[1]["ETag"],
+                         f'"{expected}"')
+        invalid = Path(self.temp.name) / "invalid.json"
+        invalid.write_text('{"endpoints":[]}', encoding="utf-8")
+        result = subprocess.run(command + args + [str(invalid)], capture_output=True,
+                                text=True, env=env, timeout=10)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(self.upstream.calls.empty())
+
+    def test_tokenless_local_profile_and_explicit_missing_token(self):
+        config = {"endpoints": [{"id": "a", "model": "test", "protocol": "ollama",
+                                 "base_url": "http://127.0.0.1:11434"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            with gateway(config, directory, with_token=False) as port:
+                self.assertEqual(request(port, "/v1/models")[0], 200)
+            config["token_env"] = "FIXTURE_GATEWAY_TOKEN"
+            with self.assertRaisesRegex(RuntimeError, "Gateway startup failed"):
+                with gateway(config, directory, with_token=False):
+                    self.fail("missing explicitly configured token allowed startup")
+
+    def test_redirect_is_not_followed(self):
+        self.assertEqual(self.chat("move")[0], 502)
+        self.assertEqual(self.upstream.calls.get(timeout=1)[2]["model"], "redirect")
+        self.assertTrue(self.upstream.calls.empty())
+
+    def test_busy_request_keeps_health_available(self):
+        result = []
+        thread = threading.Thread(target=lambda: result.append(self.chat("slow")[0]))
+        thread.start()
+        try:
+            self.assertTrue(self.upstream.started.wait(2))
+            self.assertEqual(self.chat("a")[0], 429)
+            self.assertEqual(request(self.port, "/healthz")[0], 200)
+        finally:
+            self.upstream.release.set()
+            thread.join(7)
+        self.assertEqual(result, [200])
+        self.assertEqual(self.upstream.calls.get(timeout=1)[2]["model"], "delayed")
+        self.assertTrue(self.upstream.calls.empty())
+
+
+if __name__ == "__main__":
+    unittest.main()

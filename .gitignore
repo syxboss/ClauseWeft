@@ -1,0 +1,28 @@
+.DS_Store
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+/build/
+/dist/
+.env
+.env.*
+!.env.example
+
+# Local state, credentials and developer tooling
+.ruff_cache/
+.playwright/
+controller.lock
+workspace.sqlite3*
+*.sqlite
+*.sqlite3*
+*.sqlite-wal
+*.sqlite-shm
+*.spec
+console-token
+gateway-token
+
+# Dependencies are rebuilt from the agent image lockfile.
+/examples/agent-image/node_modules/

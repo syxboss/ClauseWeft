@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f1f5f6">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#10151d">
+<meta name="description" content="ClauseWeft 个人 AI 工作台">
+<title>ClauseWeft · 研发工作台</title>
+<style>$style</style>
+</head>
+<body>
+<a class="skip" href="#content">跳至内容</a>
+<main id="access" class="entry">
+  <div class="entry-layout">
+    <section class="entry-print">
+      <div class="wordmark">$wordmark</div>
+      <h2>个人 AI 工作台</h2>
+      <canvas class="signal-field" aria-hidden="true" width="1100" height="680"></canvas>
+    </section>
+    <section class="entry-login">
+      <h1>连接工作台</h1>
+      <p class="entry-intro">首次使用，请输入启动时取得的本机访问令牌。</p>
+      <div class="entry-tabs" id="login-tabs" role="group" aria-label="登录方式"><button type="button" class="active" aria-pressed="true" data-action="login-mode" data-id="pair">个人配对</button><button type="button" aria-pressed="false" data-action="login-mode" data-id="account">已有账号</button><button type="button" aria-pressed="false" data-action="login-mode" data-id="token">管理员</button></div>
+      <form id="login">
+        <div id="account-fields" hidden><label>用户名<input id="username" name="username" autocomplete="username"></label><label>密码<input type="password" id="password" name="password" autocomplete="current-password"></label></div>
+        <div id="token-fields"><label>本机访问令牌<input type="password" id="token" name="token" autocomplete="off" required></label></div>
+        <p id="login-error" class="form-error" role="alert"></p>
+        <button class="primary full" type="submit">进入工作空间 <span aria-hidden="true">↗</span></button>
+      </form>
+      <p class="entry-help">配对后可在此浏览器使用 12 小时；退出登录可提前结束会话。</p>
+    </section>
+  </div>
+</main>
+<div id="shell" hidden>
+  <header class="mast">
+    <div class="mast-inner topbar">
+      <a class="wordmark" href="#overview" aria-label="ClauseWeft 工作台">$wordmark</a>
+      <label class="scope-select"><span>工作空间</span><select id="workspace-select" aria-label="当前工作空间"></select></label>
+      <div class="nav-tools">
+        <label class="project-scope"><select id="project" aria-label="当前项目"><option value="">空间内所有项目</option></select></label>
+        <label class="page-search"><span aria-hidden="true"></span><input id="search" type="search" placeholder="筛选当前页" aria-label="筛选当前页面"></label>
+      </div>
+      <div class="top-actions">
+        <button class="primary" data-action="new-run" hidden><span aria-hidden="true">＋</span>新建任务</button>
+        <button class="profile-control" data-action="account" aria-label="账号信息"><span id="avatar">A</span><span><strong id="user-name">管理员</strong><small id="user-role">管理工作空间</small></span></button>
+        <button class="menu-control" data-action="mobile-menu" aria-expanded="false" aria-controls="sidebar">导航</button>
+      </div>
+    </div>
+  </header>
+  <div class="navigation-band" id="sidebar">
+    <div class="navigation-inner">
+      <nav id="nav" aria-label="主导航"></nav>
+
+    </div>
+  </div>
+  <div id="notice" class="toast" role="status" aria-live="polite" hidden></div>
+  <div id="workspace-banner" class="workspace-banner" hidden></div>
+  <main id="content" tabindex="-1"></main>
+</div>
+<dialog id="sheet" class="sheet" aria-labelledby="sheet-title"><div class="sheet-head"><h2 id="sheet-title"></h2><button type="button" class="icon-button" data-action="close-sheet" aria-label="关闭">×</button></div><div id="sheet-body"></div></dialog>
+<script>$browser_script</script>
+</body>
+</html>

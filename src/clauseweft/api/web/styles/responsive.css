@@ -1,0 +1,174 @@
+@media (prefers-reduced-motion: reduce) {
+* {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+@media (min-width: 1700px) {
+.overview-grid {
+    grid-template-columns: minmax(0, 1fr) 340px;
+  }
+}
+@media (max-width: 1200px) {
+.overview-grid {
+    grid-template-columns: minmax(0, 1fr) 265px;
+    gap: 18px;
+  }
+th,
+td {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+.project-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+.project-strip > :nth-child(3) {
+    display: none;
+  }
+.role-cards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+.designer {
+    grid-template-columns: minmax(0, 1fr) 235px;
+  }
+}
+@media (max-width: 950px) {
+.overview-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+.overview-grid > .aside {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+  }
+.overview-grid > .aside > .block {
+    margin-bottom: 0;
+  }
+.metric {
+    padding: 16px;
+  }
+.metric-value {
+    font-size: 25px;
+  }
+.review-layout {
+    grid-template-columns: 1fr;
+  }
+.settings-grid {
+    grid-template-columns: 1fr;
+  }
+.designer {
+    grid-template-columns: 1fr;
+  }
+.designer-inspector {
+    border-left: none;
+    border-top: 1px solid var(--line);
+    max-height: none;
+  }
+.designer-inspector form {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0 15px;
+  }
+.role-cards {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+@media (max-width: 700px) {
+.overview-grid > * {
+    min-width: 0;
+  }
+.page-heading {
+    gap: 14px;
+  }
+.page-heading h1 {
+    font-size: 23px;
+  }
+.page-heading p {
+    font-size: 11px;
+    max-width: 260px;
+  }
+.metric-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+.metric:nth-child(3) {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+.metric:nth-child(4) {
+    border-top: 1px solid var(--line);
+  }
+.metric-value {
+    font-size: 26px;
+  }
+.overview-grid > .aside {
+    display: block;
+  }
+.overview-grid > .aside > .block {
+    margin-bottom: 18px;
+  }
+.project-strip {
+    grid-template-columns: 1fr;
+  }
+.project-strip > :nth-child(3) {
+    display: block;
+  }
+.project-strip .project-card {
+    padding: 16px;
+  }
+.role-cards {
+    grid-template-columns: 1fr;
+  }
+.field-grid {
+    grid-template-columns: 1fr;
+  }
+.field-grid .span {
+    grid-column: auto;
+  }
+.tabs {
+    gap: 17px;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+.sheet-head {
+    padding: 20px;
+  }
+.sheet-body,
+#sheet-body {
+    padding: 20px;
+  }
+.board {
+    grid-template-columns: repeat(5, 230px);
+  }
+.flow-stage {
+    padding: 18px;
+  }
+.designer-inspector form {
+    display: block;
+  }
+.run-meta {
+    gap: 10px;
+  }
+.toast {
+    max-width: calc(100vw - 32px);
+    right: 16px;
+    top: 73px;
+  }
+.section-title {
+    margin-top: 20px;
+  }
+.page-heading .actions {
+    flex-shrink: 0;
+  }
+.page-heading .actions button {
+    font-size: 10px;
+  }
+.block-heading {
+    padding: 14px 16px;
+  }
+.block-body {
+    padding: 16px;
+  }
+.key-value {
+    grid-template-columns: 110px 1fr;
+  }
+}

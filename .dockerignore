@@ -1,0 +1,11 @@
+**
+!Dockerfile
+!src/clauseweft/**/*.py
+!src/clauseweft/api/web/page.html
+!src/clauseweft/api/web/scripts/*.js
+!src/clauseweft/api/web/styles/*.css
+!examples/route-demo.json
+!LICENSE
+**/__pycache__
+**/*.py[cod]
+**/.DS_Store

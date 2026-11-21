@@ -1,0 +1,40 @@
+{
+  "task": {
+    "text": "请评审管理员导出 CSV 的需求",
+    "stage": "auto",
+    "data_scope": "local_only",
+    "preference": "cost",
+    "input_tokens": 2400,
+    "max_output_tokens": 600,
+    "budget_micros": 5000,
+    "required_capabilities": ["structured_output"]
+  },
+  "models": [
+    {
+      "endpoint_id": "local-review",
+      "model_identity": "demo-reviewer-a",
+      "location": "local",
+      "enabled": true,
+      "allowed": true,
+      "context_tokens": 8192,
+      "capabilities": ["structured_output"],
+      "fit": {"review": 4, "requirements": 5},
+      "priority": 1,
+      "input_micros_per_million": 500000,
+      "output_micros_per_million": 1000000
+    },
+    {
+      "endpoint_id": "cloud-general",
+      "model_identity": "demo-model-b",
+      "location": "cloud",
+      "enabled": true,
+      "allowed": true,
+      "context_tokens": 32768,
+      "capabilities": ["structured_output"],
+      "fit": {"review": 4, "code": 5, "test": 5},
+      "priority": 2,
+      "input_micros_per_million": 250000,
+      "output_micros_per_million": 500000
+    }
+  ]
+}
