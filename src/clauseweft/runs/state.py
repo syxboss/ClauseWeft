@@ -93,7 +93,8 @@ def describe_run(db, run_id):
             )
     return dict(
         run_id=run_id,
-        **({k: body[k] for k in ("tool_id", "allowed_tools", "max_tool_steps", "requirement_query", "reference_digest") if k in body}),
+        **({k: body[k] for k in ("tool_id", "allowed_tools", "max_tool_steps", "requirement_query",
+                                  "reference_digest", "tool_approval_policy", "max_fix_rounds") if k in body}),
         title=body.get("title") or body["task"]["text"].splitlines()[0][:120],
         project_id=body.get("project_id", "default"),
         requirement_id=body.get("requirement_id"),

@@ -10,6 +10,7 @@ import secrets
 import sqlite3
 import sys
 import threading
+import time
 from uuid import uuid4
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -122,6 +123,13 @@ class Handler(BaseHTTPRequestHandler):
         args = parse_qs(url.query, max_num_fields=10, keep_blank_values=True)
         if any(len(v) != 1 for v in args.values()):
             raise ValueError("查询参数重复")
+        if (
+            self.command == "GET"
+            and len(parts) == 3
+            and parts[2] == "stream"
+            and parts[0] in ("runs", "agent-jobs")
+        ):
+            return self.stream_events(parts[0], parts[1], {k: v[0] for k, v in args.items()}, principal)
         data = {}
         key = None
         revision = None
@@ -189,6 +197,107 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ("auth", "logout") and status == 200:
             self.server.app.platform.logout(credential)
         self.respond(status, body)
+
+    def stream_events(self, kind, resource_id, query, principal):
+        from .platform import BOOTSTRAP
+
+        after = int(query.get("after", "0"))
+        timeout = float(query.get("timeout", "30"))
+        if after < 0 or not 0.1 <= timeout <= 60.0:
+            raise ValueError("after 或 timeout 参数无效")
+        stop_on_input = query.get("stop_on_input") == "1"
+        app = self.server.app
+        actor = principal or BOOTSTRAP
+        app.request_context.principal = actor
+        app.request_context.correlation_id = self.correlation_id
+        app.store.local.audit_actor = actor
+        app.store.local.audit_correlation_id = self.correlation_id
+        with app.store.transaction() as db:
+            actor = app.platform.public_actor(db, actor)
+            app.request_context.principal = actor
+            app.authorize(db, "GET", (kind, resource_id), {}, {})
+        self.application_handled = True
+        self.audit_http(200, "read")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Request-ID", self.correlation_id)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def send_sse(event_name, payload, event_id=None):
+            lines = []
+            if event_id is not None:
+                lines.append(f"id: {event_id}")
+            lines.append(f"event: {event_name}")
+            lines.append("data: " + json.dumps(payload, ensure_ascii=True, allow_nan=False))
+            self.wfile.write(("\n".join(lines) + "\n\n").encode("utf-8"))
+            self.wfile.flush()
+
+        deadline = time.monotonic() + timeout
+        last_ping = time.monotonic()
+        cursor = after
+        try:
+            while True:
+                with app.store.transaction() as db:
+                    try:
+                        current_actor = app.platform.public_actor(db, actor)
+                        app.request_context.principal = current_actor
+                        app.authorize(db, "GET", (kind, resource_id), {}, {})
+                    except Problem:
+                        send_sse("revoked", {"reason": "authorization_changed"})
+                        return
+                    if kind == "runs":
+                        rows = db.execute(
+                            "SELECT seq, at, kind, data FROM events WHERE run_id=? AND seq>? ORDER BY seq",
+                            (resource_id, cursor),
+                        ).fetchall()
+                        status_row = db.execute(
+                            "SELECT status FROM runs WHERE run_id=?", (resource_id,)
+                        ).fetchone()
+                        status = status_row["status"] if status_row else "cancelled"
+                    else:
+                        rows = db.execute(
+                            "SELECT seq, event FROM agent_job_events WHERE job_id=? AND seq>? ORDER BY seq",
+                            (resource_id, cursor),
+                        ).fetchall()
+                        status_row = db.execute(
+                            "SELECT status FROM agent_jobs WHERE id=?", (resource_id,)
+                        ).fetchone()
+                        status = status_row["status"] if status_row else "cancelled"
+                for row in rows:
+                    cursor = row["seq"]
+                    if kind == "runs":
+                        send_sse(
+                            row["kind"],
+                            {"seq": row["seq"], "at": row["at"], "kind": row["kind"], "data": json.loads(row["data"])},
+                            event_id=row["seq"],
+                        )
+                    else:
+                        ev = json.loads(row["event"])
+                        send_sse(ev.get("type", "event"), dict(ev, seq=row["seq"]), event_id=row["seq"])
+                terminal = (
+                    status in ("completed", "cancelled") or (stop_on_input and status == "needs_input")
+                    if kind == "runs"
+                    else status in ("succeeded", "failed", "cancelled", "interrupted")
+                )
+                if terminal:
+                    send_sse("status", {"status": status, "after": cursor})
+                    return
+                now = time.monotonic()
+                if now >= deadline:
+                    send_sse("timeout", {"status": status, "after": cursor})
+                    return
+                if now - last_ping >= 5.0:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_ping = now
+                time.sleep(0.15)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
     def serve(self):
         try:

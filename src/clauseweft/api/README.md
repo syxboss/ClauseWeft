@@ -32,10 +32,10 @@ PYTHONPATH=src python3.11 -m clauseweft serve --config examples/workbench.json -
 |---|---|---|
 | 普通任务 | 可省略 `mode`。选角色时在顶层传 `role_id`，附加技能传 `skill_ids`。角色的阶段和已绑定端点参与路由，同时指定相冲突的模型会被拒绝 | 运行包含 `task` 节点。选角色后可读取 `role_id`、`role_name`、`role_revision` 和实际请求上下文 |
 | 复杂任务 | `mode=complex`，必填总 `budget`。可用 `task.pinned_endpoint` 固定全图模型，`skill_ids` 应用于规划、分支和汇总，`max_concurrency` 控制并发 | 预览返回 `preview_node=plan`。有效规划回执生成 `branch-1` 至 `branch-N` 及 `summary`，可按节点读取成果 |
-| 内置仓库交付 | `mode=workflow`，提供 `repo_id`、`base_sha`、`suite_id`。工作台要求填写预算，API 省略时按 USD 零额度检查派发 | 取得固定的需求基线、评审、补丁、实测和接纳节点 |
+| 内置仓库交付 | `mode=workflow`，提供 `repo_id`、`base_sha`、`suite_id`，可选 `max_fix_rounds`（0–3 轮测试失败自动返工） | 取得固定的需求基线、评审、补丁、实测和接纳节点；启用 `max_fix_rounds` 时测试失败自动带日志返工 `code` 节点 |
 | 团队 SOP | 传已发布的 `template_id`，服务端取得该版本的执行方式、角色及依赖 | 模型节点由 worker 调用，人工关卡等待操作者决定 |
-| 项目工具 | 传 `mode=tool`、`tool_id` 和显式总 `budget` | 模型拟参、人工确认并执行、模型读取回执作答，节点依次为 `propose`、`confirm`、`answer` |
-| 多步项目工具 | 传 `mode=tool`、`allowed_tools` 和总 `budget`，可设置 `max_tool_steps` 和 `requirement_query` | 每轮 `decide-N` 读取目标与之前全部回执，提议获准后在 `confirm-N` 执行。最终答复节点标记 `is_agent_answer=true` |
+| 项目工具 | 传 `mode=tool`、`tool_id` 和显式总 `budget`，可选 `tool_approval_policy`（`always` / `auto_read_only`） | 模型拟参、人工确认（或只读自动执行）并记录回执、模型读取回执作答 |
+| 多步项目工具 | 传 `mode=tool`、`allowed_tools` 和总 `budget`，可设 `max_tool_steps`、`requirement_query`、`tool_approval_policy` | 每轮 `decide-N` 读取目标与之前全部回执；`auto_read_only` 下只读检索自动执行，写入操作继续人工审批；支持 `GET runs/{id}/stream` SSE 实时事件流 |
 
 复杂任务默认阶段为 `general`。模型规划须是仅含 `subtasks` 的 JSON 对象，值为 2 至 8 个字符串，每项去除首尾空白后长 1 至 4,000 字符。模板、仓库交付字段及逐节点 `pinned_endpoints` 用于其他任务方式。计划无效时 `plan` 进入 `needs_input`，原答复留在尝试记录，原因为 `invalid_complex_plan`。通过 `POST runs/{id}/resume` 可重试。有效分工已经生成后，如需更换整套计划则创建新任务。[可复现的创建及读取示例](../../../docs/11-任务执行与模型用量.md)
 

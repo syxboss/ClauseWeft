@@ -33,6 +33,7 @@ async function newRun(options = {}) {
       <div id="tool-query">${field("requirement_query","查重关键词","","text",{help:"用 1 至 160 字指定要核对的需求。命中时引用已有需求，未命中时提议新建。"})}</div>
       <div id="tool-reference">${field("include_reference","允许检索本项目知识库",false,"checkbox")}</div>
       <div id="tool-steps">${field("max_tool_steps","最多执行几次工具",4,"number",{min:1,max:8,step:1})}</div>
+      <div id="tool-approval">${field("auto_read_only","只读检索工具自动执行（仅写入操作需审批）",false,"checkbox")}</div>
       <p class="field-help" id="project-tool-help"></p></div>
     ${modelSelect(selectedModel)}<p class="field-help" id="selected-model-price"></p>
     <details class="optional-panel" id="task-options" ${options.template_id ? "open" : ""}><summary>执行设置与费用上限</summary>
@@ -55,6 +56,7 @@ async function newRun(options = {}) {
         ${field("repo_id", "受信仓库", project?.repository_id || "", "select", {options:[["","请选择"],...state.workspace.repositories.map((id) => [id,id])]})}
         ${field("base_sha", "基准提交 SHA", "")}
         ${field("suite_id", "验收套件", "", "select", {options:[["","使用仓库默认"],...state.workspace.suites.map((id) => [id,id])]})}
+        ${field("max_fix_rounds", "测试失败自动修复轮次（0–3）", 0, "number", {min:0,max:3,step:1})}
       </div>
       <div class="actions">${button("preview-plan","预览路由与预算")}</div><p class="form-error" id="preview-error"></p><div id="preview-result" class="form-preview"></div>
     </details>`,
@@ -186,6 +188,7 @@ function makePlan(data) {
     } else {
       plan.tool_id = choice;
     }
+    if (data.auto_read_only === "on") plan.tool_approval_policy = "auto_read_only";
   }
   if (template) {
     if (template.nodes?.some((node) => node.kind !== "gate") && !plan.budget)
@@ -197,6 +200,9 @@ function makePlan(data) {
     if (!data.repo_id || !data.base_sha) throw Error("请选择受信仓库并填写基准提交 SHA");
     plan.mode="workflow";plan.repo_id=data.repo_id;plan.base_sha=data.base_sha;
     if (data.suite_id) plan.suite_id=data.suite_id;
+    const fixRounds = Number(data.max_fix_rounds ?? 0);
+    if (!Number.isInteger(fixRounds) || fixRounds < 0 || fixRounds > 3) throw Error("自动修复轮次应为 0 至 3 的整数");
+    if (fixRounds > 0) plan.max_fix_rounds = fixRounds;
   }
   return plan;
 }

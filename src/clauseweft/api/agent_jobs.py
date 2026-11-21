@@ -1,4 +1,4 @@
-"""Owner-scoped external Agent jobs, frozen source snapshots and durable receipts."""
+"""Owner-scoped external Agent jobs, frozen source snapshots, tests and durable receipts."""
 import hashlib
 import json
 import os
@@ -8,17 +8,35 @@ import sqlite3
 import tempfile
 import time
 
-from clauseweft import audit
-from clauseweft import agent_runtime
+from clauseweft import agent_runtime, audit, testing
 from clauseweft.workspace.credentials import contains, redact
 
 from . import agent_workspace
+from .delivery_jobs import format_test_feedback
 from .http_contracts import Problem, encode, ident, match, require_object, text
 
 _SHA = re.compile(r"(?:[a-f0-9]{40}|[a-f0-9]{64})")
 _EVENT = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 _FIELDS = ("id", "project_id", "runner_id", "kind", "repo_id", "base_sha", "review_of",
-           "status", "revision", "created", "error")
+           "continue_from", "suite_id", "max_fix_rounds", "status", "revision", "created", "error")
+
+
+def _repo_suites(repo, configured_suites):
+    suites = repo.get("suite_ids")
+    if isinstance(suites, list):
+        return [s for s in suites if s in configured_suites]
+    default = repo.get("suite_id")
+    return [default] if default and default in configured_suites else []
+
+
+def _merge_usage(total, latest):
+    if not isinstance(latest, dict):
+        return total
+    merged = dict(total)
+    for key, value in latest.items():
+        if type(value) is int and value >= 0:
+            merged[key] = merged.get(key, 0) + value
+    return merged
 
 
 class AgentJobs:
@@ -32,12 +50,28 @@ class AgentJobs:
             id TEXT PRIMARY KEY, project_id TEXT NOT NULL, owner TEXT NOT NULL,
             runner_id TEXT NOT NULL, kind TEXT NOT NULL, runner_binding TEXT NOT NULL,
             repo_id TEXT NOT NULL, repo_binding TEXT NOT NULL, base_sha TEXT NOT NULL,
-            snapshot_ref TEXT NOT NULL, review_of TEXT, prompt TEXT NOT NULL, status TEXT NOT NULL,
+            snapshot_ref TEXT NOT NULL, base_snapshot_ref TEXT, review_of TEXT,
+            continue_from TEXT, suite_id TEXT, max_fix_rounds INTEGER NOT NULL DEFAULT 0,
+            prompt TEXT NOT NULL, status TEXT NOT NULL,
             revision INTEGER NOT NULL, created REAL NOT NULL, error TEXT, result_ref TEXT)""")
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(agent_jobs)")}
+        for col, ddl in (
+            ("base_snapshot_ref", "TEXT"),
+            ("continue_from", "TEXT"),
+            ("suite_id", "TEXT"),
+            ("max_fix_rounds", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if col not in columns:
+                db.execute(f"ALTER TABLE agent_jobs ADD COLUMN {col} {ddl}")
         db.execute("CREATE INDEX IF NOT EXISTS agent_job_queue ON agent_jobs(status,created)")
         db.execute("""CREATE TABLE IF NOT EXISTS agent_job_events (
             job_id TEXT NOT NULL REFERENCES agent_jobs, seq INTEGER NOT NULL,
             event TEXT NOT NULL, PRIMARY KEY(job_id,seq))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS agent_job_tests (
+            id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES agent_jobs,
+            suite_id TEXT NOT NULL, status TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0,
+            created REAL NOT NULL, report_ref TEXT NOT NULL)""")
+        db.execute("CREATE INDEX IF NOT EXISTS agent_job_tests_by_job ON agent_job_tests(job_id,created)")
         for row in db.execute("SELECT * FROM agent_jobs WHERE status='running'").fetchall():
             self.transition(db, row, "interrupted", error="工作台已重启，外部执行结果未知")
 
@@ -77,56 +111,159 @@ class AgentJobs:
         if "admin" not in actor["capabilities"]:
             raise Problem(403, "ADMIN_REQUIRED", "外部 Agent 需要所有者或管理员权限")
         if parts == ("agent-jobs",) and method == "POST":
-            require_object(body, ("project_id", "runner_id", "repo_id", "prompt", "base_sha", "review_of"),
-                           ("project_id", "runner_id", "repo_id", "prompt"))
+            require_object(
+                body,
+                ("project_id", "runner_id", "repo_id", "prompt", "base_sha", "review_of",
+                 "continue_from", "suite_id", "max_fix_rounds"),
+                ("project_id", "runner_id", "repo_id", "prompt"),
+            )
             for key in body:
+                if key == "max_fix_rounds":
+                    continue
                 text(body[key], key, maximum=16000 if key == "prompt" else 256)
+            if "max_fix_rounds" in body:
+                rounds = body["max_fix_rounds"]
+                if type(rounds) is not int or not 0 <= rounds <= 3:
+                    raise ValueError("自动修复轮次上限须为 0 至 3 的整数")
             self.check_credentials((body["prompt"],))
             if contains(body["prompt"].encode()):
                 raise ValueError("任务文本包含可能的凭据")
             if body["runner_id"] not in self.runners:
                 raise ValueError("请选择已登记的执行器")
+            runner = self.runners[body["runner_id"]]
             if body["repo_id"] not in self.available_repos(db, body["project_id"], actor):
                 raise Problem(403, "DATA_SCOPE", "项目、工作空间和仓库须允许外部执行")
+            repo = self.app.delivery.repositories[body["repo_id"]]
+            if body.get("review_of") and body.get("continue_from"):
+                raise ValueError("review_of 与 continue_from 不能同时指定")
+            if "suite_id" in body:
+                if runner.kind != "claude":
+                    raise ValueError("仅代码修改执行器支持绑定验收测试套件")
+                self.app.delivery.check_suite(repo, body["suite_id"])
+            if body.get("max_fix_rounds", 0) > 0 and not body.get("suite_id"):
+                raise ValueError("开启自动修复循环须同时指定 suite_id")
             if body.get("review_of"):
                 prior = self.owner_row(db, body["review_of"])
-                if (self.runners[body["runner_id"]].kind != "deepseek" or prior["kind"] != "claude"
+                if (runner.kind != "deepseek" or prior["kind"] != "claude"
                         or prior["status"] != "succeeded" or prior["project_id"] != body["project_id"]
                         or prior["repo_id"] != body["repo_id"] or "base_sha" in body
-                        or prior["repo_binding"] != self.app.repo_binding(self.app.delivery.repositories[body["repo_id"]])):
+                        or prior["repo_binding"] != self.app.repo_binding(repo)):
                     raise Problem(409, "INVALID_REVIEW", "请使用同项目同仓库的已完成代码任务进行评审")
+            elif body.get("continue_from"):
+                prior = self.owner_row(db, body["continue_from"])
+                if (runner.kind != "claude" or prior["kind"] != "claude"
+                        or prior["status"] != "succeeded" or prior["project_id"] != body["project_id"]
+                        or prior["repo_id"] != body["repo_id"] or "base_sha" in body
+                        or not prior["result_ref"]
+                        or prior["repo_binding"] != self.app.repo_binding(repo)):
+                    raise Problem(409, "INVALID_CONTINUATION", "请使用同项目同仓库的已完成代码任务继续修改")
             elif body.get("base_sha", "HEAD") != "HEAD" and not _SHA.fullmatch(body["base_sha"]):
                 raise ValueError("基准须为 HEAD 或完整 Git 提交 SHA")
             return
         if method == "GET" and parts in (("agent-jobs",), ("agent-jobs", "options")):
             self.app.platform.authorize_project(db, text(query.get("project_id"), "project_id", maximum=256), actor)
             return
-        if ((len(parts) == 2 and method == "GET")
-                or (len(parts) == 3 and parts[2] == "cancel" and method == "POST")):
-            if method == "POST":
-                require_object(body, ())
+        if len(parts) == 2 and method == "GET":
             self.owner_row(db, parts[1])
+            return
+        if len(parts) == 3 and parts[2] == "cancel" and method == "POST":
+            require_object(body, ())
+            self.owner_row(db, parts[1])
+            return
+        if len(parts) == 3 and parts[2] == "tests" and method == "POST":
+            require_object(body, ("suite_id",))
+            if "suite_id" in body:
+                text(body["suite_id"], "suite_id", maximum=256)
+            row = self.owner_row(db, parts[1])
+            if row["kind"] != "claude" or row["status"] != "succeeded" or not row["result_ref"]:
+                raise Problem(409, "INVALID_TEST_TARGET", "仅已完成的代码任务可运行验收测试")
+            repo = self.app.delivery.repositories.get(row["repo_id"])
+            if not repo or self.app.repo_binding(repo) != row["repo_binding"]:
+                raise Problem(409, "REPO_CHANGED", "仓库配置已变更")
+            suite_id = body.get("suite_id") or repo.get("suite_id")
+            self.app.delivery.check_suite(repo, suite_id)
             return
         raise Problem(404, "NOT_FOUND", "外部任务入口不存在")
 
     def prepare(self, body):
         repo = self.app.delivery.repositories[body["repo_id"]]
-        if body.get("review_of"):
+        source_id = body.get("review_of") or body.get("continue_from")
+        if source_id:
             with self.app.store.transaction() as db:
-                prior = self.owner_row(db, body["review_of"])
+                prior = self.owner_row(db, source_id)
             evidence = json.loads(self.app.store.read_blob(prior["result_ref"]))
             files = json.loads(self.app.store.read_blob(evidence["candidate_ref"]))
             self.check_credentials((*files.keys(), *files.values(), evidence["patch"]))
             size = sum(len(value.encode()) for value in files.values()) + len(evidence["patch"].encode())
             if len(files) >= 512 or size > 2 * 1024 * 1024:
                 raise ValueError("候选文件与评审补丁合计须在 512 文件、2 MiB 以内")
-            return prior["base_sha"], evidence["candidate_ref"]
+            base_snapshot = prior["base_snapshot_ref"] or prior["snapshot_ref"]
+            return prior["base_sha"], evidence["candidate_ref"], base_snapshot
         with tempfile.TemporaryDirectory(dir=self.app.root) as directory:
             sha, files = agent_workspace.snapshot(Path(directory), repo, body.get("base_sha", "HEAD"))
         self.check_credentials((*files.keys(), *files.values()))
         if not files:
             raise ValueError("基准没有允许发送的文本文件")
-        return sha, self.app.store.stage_blob(encode(files))
+        snap = self.app.store.stage_blob(encode(files))
+        return sha, snap, snap
+
+    def _run_candidate_suite(self, repo_id, suite_id, files, candidate_ref):
+        repo = self.app.delivery.repositories[repo_id]
+        self.app.delivery.check_suite(repo, suite_id)
+        frozen = testing.freeze_suite(suite_id, self.app.delivery.suites[suite_id])
+        candidate = {"candidate_sha": candidate_ref, "tree_hash": candidate_ref}
+        file_bytes = {path: content.encode("utf-8") for path, content in files.items()}
+        report = testing.start(candidate, frozen, file_bytes)
+        verified = testing.verify(report, candidate, frozen)
+        report_ref = self.app.store.stage_blob(encode(report))
+        return suite_id, report, verified, report_ref
+
+    def prepare_test(self, job_id, body):
+        with self.app.store.transaction() as db:
+            row = self.owner_row(db, job_id)
+            repo = self.app.delivery.repositories[row["repo_id"]]
+            suite_id = body.get("suite_id") or repo.get("suite_id")
+            self.app.delivery.check_suite(repo, suite_id)
+            evidence = json.loads(self.app.store.read_blob(row["result_ref"]))
+            candidate_ref = evidence["candidate_ref"]
+            files = json.loads(self.app.store.read_blob(candidate_ref))
+        return self._run_candidate_suite(row["repo_id"], suite_id, files, candidate_ref)
+
+    def _record_test(self, db, row, suite_id, report, verified, report_ref, actor):
+        test_id = ident()
+        created = time.time()
+        status = "passed" if verified else report.get("status", "failed")
+        db.execute(
+            """INSERT INTO agent_job_tests(id,job_id,suite_id,status,verified,created,report_ref)
+               VALUES(?,?,?,?,?,?,?)""",
+            (test_id, row["id"], suite_id, status, 1 if verified else 0, created, report_ref),
+        )
+        self.event(db, row["id"], {"type": "test_passed" if verified else "test_failed", "tool": suite_id})
+        audit.record(
+            db, actor, "agent.tested", f"agent-jobs/{row['id']}/tests/{test_id}",
+            outcome="succeeded" if verified else "failed",
+            project_id=row["project_id"],
+            details={"job_id": row["id"], "suite_id": suite_id, "status": status,
+                     "verified": verified, "report_ref": report_ref},
+        )
+        return {
+            "id": test_id, "job_id": row["id"], "suite_id": suite_id,
+            "status": status, "verified": verified, "created": created, "report": report,
+        }
+
+    def _test_reports(self, db, job_id):
+        rows = db.execute(
+            "SELECT * FROM agent_job_tests WHERE job_id=? ORDER BY created DESC, id DESC",
+            (job_id,),
+        ).fetchall()
+        return [
+            {
+                "id": r["id"], "job_id": r["job_id"], "suite_id": r["suite_id"],
+                "status": r["status"], "verified": bool(r["verified"]), "created": r["created"],
+                "report": json.loads(self.app.store.read_blob(r["report_ref"])),
+            }
+            for r in rows
+        ]
 
     def brief(self, row):
         item = {key: row[key] for key in _FIELDS}
@@ -151,23 +288,32 @@ class AgentJobs:
 
     def read(self, db, parts, query):
         if parts == ("agent-jobs", "options"):
+            repos = []
+            for key in self.available_repos(db, query["project_id"], self.app.actor()):
+                repo = self.app.delivery.repositories[key]
+                entry = {"id": key}
+                suites = _repo_suites(repo, self.app.delivery.suites)
+                if suites:
+                    entry["suites"] = suites
+                repos.append(entry)
             return {"runners": [{"id": key, "kind": value.kind} for key, value in self.runners.items()],
-                    "repositories": [{"id": key} for key in self.available_repos(db, query["project_id"], self.app.actor())]}
+                    "repositories": repos}
         if parts == ("agent-jobs",):
             limit, offset = int(query.get("limit", 50)), int(query.get("cursor", 0))
             if not 1 <= limit <= 100 or not 0 <= offset <= 2**31 - 1:
                 raise ValueError("无效分页")
             rows = db.execute("""SELECT * FROM agent_jobs WHERE project_id=? AND owner=?
                 ORDER BY created DESC,id LIMIT ? OFFSET ?""",
-                (query["project_id"], self.app.actor()["id"], limit+1, offset)).fetchall()
+                (query["project_id"], self.app.actor()["id"], limit + 1, offset)).fetchall()
             return {"items": [self.brief(r) for r in rows[:limit]],
-                    "next_cursor": offset+limit if len(rows) > limit else None}
+                    "next_cursor": offset + limit if len(rows) > limit else None}
         row = self.owner_row(db, parts[1])
         events = [json.loads(r[0]) for r in db.execute(
             "SELECT event FROM agent_job_events WHERE job_id=? ORDER BY seq", (row["id"],))]
         result = json.loads(self.app.store.read_blob(row["result_ref"])) if row["result_ref"] else {}
         result.pop("candidate_ref", None)
-        return dict(self.brief(row), prompt=row["prompt"], events=events, **result)
+        return dict(self.brief(row), prompt=row["prompt"], events=events,
+                    test_reports=self._test_reports(db, row["id"]), **result)
 
     def event(self, db, job_id, data):
         db.execute("""INSERT INTO agent_job_events
@@ -184,23 +330,32 @@ class AgentJobs:
     def write(self, db, parts, body, expected, prepared):
         if len(parts) == 1:
             job_id = ident()
-            sha, snapshot = prepared
+            sha, snapshot, base_snapshot = prepared
             repo = self.app.delivery.repositories[body["repo_id"]]
             key = body["runner_id"]
             db.execute("""INSERT INTO agent_jobs
                 (id,project_id,owner,runner_id,kind,runner_binding,repo_id,repo_binding,base_sha,
-                 snapshot_ref,review_of,prompt,status,revision,created)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'queued',1,?)""",
+                 snapshot_ref,base_snapshot_ref,review_of,continue_from,suite_id,max_fix_rounds,
+                 prompt,status,revision,created)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',1,?)""",
                 (job_id, body["project_id"], self.app.actor()["id"], key, self.runners[key].kind,
                  self.bindings[key], body["repo_id"], self.app.repo_binding(repo), sha, snapshot,
-                 body.get("review_of"), body["prompt"], time.time()))
+                 base_snapshot, body.get("review_of"), body.get("continue_from"), body.get("suite_id"),
+                 body.get("max_fix_rounds", 0), body["prompt"], time.time()))
             self.event(db, job_id, {"type": "queued"})
             audit.record(db, self.app.actor(), "agent.queued", "agent-jobs/" + job_id,
                          project_id=body["project_id"], details={"base_sha": sha, "snapshot_ref": snapshot,
                          "runner_id": key, "repo_id": body["repo_id"], "review_of": body.get("review_of"),
+                         "continue_from": body.get("continue_from"), "suite_id": body.get("suite_id"),
+                         "max_fix_rounds": body.get("max_fix_rounds", 0),
                          "runner_binding": self.bindings[key], "repo_binding": self.app.repo_binding(repo),
                          "prompt_sha256": hashlib.sha256(body["prompt"].encode()).hexdigest()})
             return 201, self.brief(self.row(db, job_id))
+        if len(parts) == 3 and parts[2] == "tests":
+            row = self.owner_row(db, parts[1])
+            suite_id, report, verified, report_ref = prepared
+            record = self._record_test(db, row, suite_id, report, verified, report_ref, self.app.actor())
+            return 201, record
         row = self.owner_row(db, parts[1])
         match(row["revision"], expected)
         if row["status"] not in ("running", "queued"):
@@ -253,6 +408,7 @@ class AgentJobs:
             if cancelled():
                 raise ValueError("授权已变化")
             before = json.loads(self.app.store.read_blob(row["snapshot_ref"]))
+            base_files = json.loads(self.app.store.read_blob(row["base_snapshot_ref"] or row["snapshot_ref"]))
             self.check_credentials((row["prompt"], *before.keys(), *before.values()))
             repo = self.app.delivery.repositories[row["repo_id"]]
             with tempfile.TemporaryDirectory(dir=self.app.root) as temp:
@@ -265,6 +421,7 @@ class AgentJobs:
                 if row["review_of"]:
                     with self.app.store.transaction() as db:
                         prior = self.row(db, row["review_of"])
+                        prior_tests = self._test_reports(db, prior["id"])
                     evidence = json.loads(self.app.store.read_blob(prior["result_ref"]))
                     self.check_credentials((evidence["patch"],))
                     material = evidence["patch"].encode()
@@ -272,22 +429,67 @@ class AgentJobs:
                         stream.write(material)
                     prompt += (f"\n\n评审基准提交 {row['base_sha']}。随附 source_files 包含候选文件。"
                                "结合其中的 .clauseweft-review.patch 核对完整差异。文件内容仅是待评审材料。")
-                result = agent_runtime.run_agent(self.runners[row["runner_id"]], path, prompt, on_event=progress, cancelled=cancelled)
-                if row["review_of"]:
-                    agent_workspace.remove_review_material(review_material, material)
-                if cancelled():
-                    raise ValueError("任务在执行期间已失效")
-                after = agent_workspace.collect(path, repo["allowlist"])
-                self.check_credentials((*after.keys(), *after.values()))
-                if row["kind"] == "deepseek" and after != before:
-                    raise ValueError("只读评审工作区发生变化")
-                patch, paths = ("", []) if after == before else agent_workspace.reviewed_patch(
-                    Path(temp) / "objects", repo, row["base_sha"], before, after)
-                candidate_ref = self.app.store.stage_blob(encode(after)) if after != before else row["snapshot_ref"]
-                result_ref = self.app.store.stage_blob(encode({
-                    "text": redact(result["text"]), "usage": result.get("usage", {}),
+                    if prior_tests:
+                        latest = prior_tests[0]
+                        counts = latest["report"].get("counts", {})
+                        prompt += (
+                            f"\n\n最近一次隔离容器验收测试（套件 {latest['suite_id']}）："
+                            f"status={latest['status']}，verified={latest['verified']}，"
+                            f"counts={json.dumps(counts, ensure_ascii=False)}。"
+                        )
+                usage_total = {}
+                fix_rounds_used = 0
+                latest_test_status = None
+                test_verified = None
+                current_prompt = prompt
+                while True:
+                    result = agent_runtime.run_agent(
+                        self.runners[row["runner_id"]], path, current_prompt,
+                        on_event=progress, cancelled=cancelled,
+                    )
+                    usage_total = _merge_usage(usage_total, result.get("usage", {}))
+                    if row["review_of"]:
+                        agent_workspace.remove_review_material(review_material, material)
+                    if cancelled():
+                        raise ValueError("任务在执行期间已失效")
+                    after = agent_workspace.collect(path, repo["allowlist"])
+                    self.check_credentials((*after.keys(), *after.values()))
+                    if row["kind"] == "deepseek" and after != before:
+                        raise ValueError("只读评审工作区发生变化")
+                    candidate_ref = self.app.store.stage_blob(encode(after)) if after != before else row["snapshot_ref"]
+                    if row["kind"] == "claude" and row["suite_id"]:
+                        progress({"type": "testing", "tool": row["suite_id"]})
+                        suite_id, report, verified, report_ref = self._run_candidate_suite(
+                            row["repo_id"], row["suite_id"], after, candidate_ref,
+                        )
+                        with self.app.store.transaction() as db:
+                            if self.row(db, row["id"])["status"] == "running":
+                                self._record_test(db, row, suite_id, report, verified, report_ref, audit.SYSTEM)
+                        latest_test_status = "passed" if verified else report.get("status", "failed")
+                        test_verified = verified
+                        if (not verified and fix_rounds_used < (row["max_fix_rounds"] or 0)
+                                and report.get("status") != "needs_configuration" and not cancelled()):
+                            fix_rounds_used += 1
+                            progress({"type": "auto_fix", "tool": f"round-{fix_rounds_used}"})
+                            current_prompt = (
+                                row["prompt"] + "\n\n"
+                                + format_test_feedback(report, fix_rounds_used, row["max_fix_rounds"])
+                            )
+                            continue
+                    break
+                diff_base = base_files if row["continue_from"] else before
+                patch, paths = ("", []) if row["kind"] == "deepseek" or after == diff_base else agent_workspace.reviewed_patch(
+                    Path(temp) / "objects", repo, row["base_sha"], diff_base, after)
+                evidence_payload = {
+                    "text": redact(result["text"]), "usage": usage_total,
                     "session_id": result.get("session_id"), "patch": patch, "paths": paths,
-                    "candidate_ref": candidate_ref}))
+                    "candidate_ref": candidate_ref,
+                }
+                if row["suite_id"]:
+                    evidence_payload["fix_rounds_used"] = fix_rounds_used
+                    evidence_payload["latest_test_status"] = latest_test_status
+                    evidence_payload["test_verified"] = test_verified
+                result_ref = self.app.store.stage_blob(encode(evidence_payload))
         except agent_runtime.AgentRuntimeError as exc:
             error = exc.code
         except (OSError, ValueError, KeyError, RuntimeError, sqlite3.Error, UnicodeError):

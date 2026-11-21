@@ -23,6 +23,8 @@ def _request_fields(data):
             "allowed_tools",
             "max_tool_steps",
             "requirement_query",
+            "tool_approval_policy",
+            "max_fix_rounds",
             "pinned_endpoints",
             "title",
             "project_id",
@@ -38,10 +40,16 @@ def _request_fields(data):
     data = dict(data)
     if data.get("mode") == "tool":
         project_tools.validate_plan(data)
-        if set(data).intersection({"repo_id", "base_sha", "suite_id", "template_id", "plan_template_id", "role_id", "skill_ids", "pinned_endpoints"}):
+        if set(data).intersection({"repo_id", "base_sha", "suite_id", "template_id", "plan_template_id", "role_id", "skill_ids", "pinned_endpoints", "max_fix_rounds"}):
             raise ValueError("项目工具只使用所选工具与本次任务配置")
-    elif {"tool_id", "allowed_tools", "max_tool_steps", "requirement_query"}.intersection(data):
+    elif {"tool_id", "allowed_tools", "max_tool_steps", "requirement_query", "tool_approval_policy"}.intersection(data):
         raise ValueError("工具授权与工具执行上限仅用于工具任务")
+    if "max_fix_rounds" in data:
+        rounds = data["max_fix_rounds"]
+        if type(rounds) is not int or not 0 <= rounds <= 3:
+            raise ValueError("自动修复轮次上限须为 0 至 3 的整数")
+        if data.get("mode", "single") != "workflow" and not data.get("template_id"):
+            raise ValueError("max_fix_rounds 仅用于代码交付流程")
     use_preferences = data.pop("use_preferences", False)
     if type(use_preferences) is not bool:
         raise ValueError("use_preferences 须为布尔值")
@@ -111,6 +119,8 @@ def _freeze_project_inputs(app, db, data, task, use_preferences):
         release = app.platform.release(db, data["template_id"])
         data["template_snapshot"] = release
         data["mode"] = release["execution_mode"]
+        if "max_fix_rounds" in data and data["mode"] != "workflow":
+            raise ValueError("max_fix_rounds 仅用于代码交付流程")
         if data["mode"] == "workflow" and project["repository_id"]:
             data.setdefault("repo_id", project["repository_id"])
     if data.get("role_id"):
