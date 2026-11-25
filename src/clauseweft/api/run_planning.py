@@ -3,7 +3,7 @@
 import re
 
 from clauseweft import project_tools
-from . import personal_preferences
+from . import personal_preferences, project_memory
 from .http_contracts import Problem, encode, require_object
 
 
@@ -33,13 +33,14 @@ def _request_fields(data):
             "role_id",
             "skill_ids",
             "use_preferences",
+            "use_project_memory",
+            "memory_ids",
             "workspace_id",
         ),
         ("task",),
     )
     data = dict(data)
     if data.get("mode") == "tool":
-        project_tools.validate_plan(data)
         if set(data).intersection({"repo_id", "base_sha", "suite_id", "template_id", "plan_template_id", "role_id", "skill_ids", "pinned_endpoints", "max_fix_rounds"}):
             raise ValueError("项目工具只使用所选工具与本次任务配置")
     elif {"tool_id", "allowed_tools", "max_tool_steps", "requirement_query", "tool_approval_policy"}.intersection(data):
@@ -55,9 +56,15 @@ def _request_fields(data):
         raise ValueError("use_preferences 须为布尔值")
     if use_preferences and (data.get("mode", "single") != "single" or data.get("template_id")):
         raise ValueError("个人偏好仅用于单任务或追问")
+    use_project_memory = data.pop("use_project_memory", False)
+    if type(use_project_memory) is not bool:
+        raise ValueError("use_project_memory 须为布尔值")
+    memory_ids = data.pop("memory_ids", None)
+    if memory_ids is not None:
+        use_project_memory = True
     task = dict(require_object(
         data["task"],
-        ("text", "materials", "stage", "preference", "pinned_endpoint", "data_scope",
+        ("text", "materials", "attachments", "stage", "preference", "pinned_endpoint", "data_scope",
          "max_output_tokens", "required_capabilities"),
         ("text",),
     ))
@@ -79,10 +86,10 @@ def _request_fields(data):
         or len(data["title"]) > 160
     ):
         raise ValueError("运行标题须为 1 到 160 个字符")
-    return data, task, use_preferences
+    return data, task, use_preferences, use_project_memory, memory_ids
 
 
-def _freeze_project_inputs(app, db, data, task, use_preferences):
+def _freeze_project_inputs(app, db, data, task, use_preferences, use_project_memory=False, memory_ids=None, *, allow_reference_reload=True):
     project_id = data.get("project_id", "default")
     if not isinstance(project_id, str):
         raise ValueError("项目 ID 无效")
@@ -93,10 +100,28 @@ def _freeze_project_inputs(app, db, data, task, use_preferences):
     workspace = app.platform.authorize_workspace(db, workspace_id)
     data["workspace_id"] = workspace_id
     data["project_id"] = project_id
+    if data.get("mode") == "tool":
+        project_tools.validate_plan(data, mcp_servers=app.mcp_servers)
+        chosen = list(data.get("allowed_tools", [])) + ([data["tool_id"]] if "tool_id" in data else [])
+        mcp_tools = {}
+        mcp_digests = {}
+        for tid in chosen:
+            if project_tools.is_mcp_tool(tid):
+                sid, name = project_tools.parse_mcp_tool(tid)
+                srv = app.mcp_servers[sid]
+                mcp_tools[tid] = dict(srv["tools"][name])
+                mcp_digests[sid] = srv["digest"]
+                if srv["data_scope"] == "local_only":
+                    task["data_scope"] = "local_only"
+        if mcp_tools:
+            data["mcp_tools"] = mcp_tools
+            data["mcp_digests"] = mcp_digests
     if project_tools.uses_reference(data):
         source = app.references.get(project_id)
         if source is None:
             raise ValueError("当前项目尚未登记知识资料源")
+        if allow_reference_reload:
+            project_tools.reload_if_changed(source)
         data["reference_digest"] = source["digest"]
         if source["data_scope"] == "local_only":
             task["data_scope"] = "local_only"
@@ -105,6 +130,12 @@ def _freeze_project_inputs(app, db, data, task, use_preferences):
         if not snapshot["instructions"]:
             raise ValueError("当前工作空间尚未保存个人偏好")
         data["personal_preferences"] = snapshot
+    if use_project_memory:
+        snapshots = project_memory.freeze(db, project_id, memory_ids=memory_ids)
+        if snapshots:
+            data["memory_snapshots"] = snapshots
+            if any(m["data_scope"] == "local_only" for m in snapshots):
+                task["data_scope"] = "local_only"
     if data.get("requirement_id"):
         requirement = app.platform.get(
             db, "requirements", data["requirement_id"]
@@ -149,9 +180,14 @@ def _freeze_project_inputs(app, db, data, task, use_preferences):
 
 
 def plan(app, data, *, inherited=None):
-    data, task, use_preferences = _request_fields(data)
+    data, task, use_preferences, use_project_memory, memory_ids = _request_fields(data)
     with app.store.transaction() as db:
-        _freeze_project_inputs(app, db, data, task, use_preferences)
+        _freeze_project_inputs(
+            app, db, data, task, use_preferences,
+            use_project_memory=use_project_memory,
+            memory_ids=memory_ids,
+            allow_reference_reload=inherited is None,
+        )
     if not isinstance(task["text"], str) or not task["text"].strip():
         raise ValueError("任务文本不能为空")
     if any(

@@ -56,7 +56,7 @@ class Response:
                         "cache_creation_input_tokens": "cache_write_tokens",
                     },
                 )
-        else:
+        elif self.kind == "deepseek":
             sid = msg.get("sessionId") if kind == "session" else None
             if kind == "status":
                 self.emit("progress")
@@ -78,6 +78,35 @@ class Response:
                 raise AgentRuntimeError("agent_failed", "DeepSeek Harness 未能完成任务")
             if kind == "final":
                 self.finish(msg.get("text"))
+        else:
+            # Generic JSON event stream adapter for codex, gemini, kimi, opencode
+            sid = msg.get("session_id") or msg.get("thread_id") or msg.get("sessionId")
+            if kind in ("tool_use", "tool_call", "item.started"):
+                tool = msg.get("tool") or msg.get("name") or (
+                    msg.get("item", {}).get("type") if isinstance(msg.get("item"), dict) else None
+                )
+                self.emit("tool_use", tool or "tool")
+            elif kind in ("progress", "status", "assistant", "item.completed"):
+                self.emit("progress")
+                item = msg.get("item") if isinstance(msg.get("item"), dict) else {}
+                if kind == "item.completed" and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                    self._last_text = item["text"]
+            elif kind == "error" or (kind == "result" and msg.get("is_error") is True):
+                raise AgentRuntimeError("agent_failed", f"{self.kind} 未能完成任务")
+            if kind in ("result", "final", "turn.completed"):
+                text = msg.get("result") or msg.get("text") or getattr(self, "_last_text", None)
+                if text is not None:
+                    self.finish(text)
+                self.count(
+                    msg.get("usage"),
+                    {
+                        "input_tokens": "input_tokens",
+                        "output_tokens": "output_tokens",
+                        "cached_input_tokens": "cache_read_tokens",
+                        "cache_read_input_tokens": "cache_read_tokens",
+                        "cache_creation_input_tokens": "cache_write_tokens",
+                    },
+                )
         if (
             isinstance(sid, str)
             and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", sid)

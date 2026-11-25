@@ -372,5 +372,322 @@ class GatewayContracts(unittest.TestCase):
         self.assertTrue(self.upstream.calls.empty())
 
 
+class ExtendedProvider(BaseHTTPRequestHandler):
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.calls.put((
+            self.path,
+            {
+                "Authorization": self.headers.get("Authorization"),
+                "x-api-key": self.headers.get("x-api-key"),
+                "anthropic-version": self.headers.get("anthropic-version"),
+                "x-goog-api-key": self.headers.get("x-goog-api-key"),
+            },
+            payload,
+        ))
+        if self.path == "/v1/messages":
+            if payload.get("stream"):
+                events = [
+                    {"type": "message_start", "message": {
+                        "id": "msg_stream_1", "model": payload["model"],
+                        "usage": {"input_tokens": 10, "cache_read_input_tokens": 4},
+                    }},
+                    {"type": "content_block_delta", "index": 0,
+                     "delta": {"type": "text_delta", "text": "anth "}},
+                    {"type": "content_block_delta", "index": 0,
+                     "delta": {"type": "text_delta", "text": "stream"}},
+                    {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                     "usage": {"output_tokens": 6}},
+                    {"type": "message_stop"},
+                ]
+                body = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            content = [{"type": "text", "text": "anthropic reply"}]
+            stop_reason = "end_turn"
+            if payload.get("tools"):
+                content = [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": payload["tools"][0]["name"],
+                    "input": {"query": "sla"},
+                }]
+                stop_reason = "tool_use"
+            data = {
+                "id": "msg_01",
+                "type": "message",
+                "role": "assistant",
+                "model": payload["model"],
+                "content": content,
+                "stop_reason": stop_reason,
+                "usage": {"input_tokens": 10, "cache_read_input_tokens": 5, "output_tokens": 4},
+            }
+        elif self.path.startswith("/v1beta/models/"):
+            if ":streamGenerateContent" in self.path:
+                chunks = [
+                    {"candidates": [{"content": {"role": "model", "parts": [{"text": "gemini "}]} }]},
+                    {"candidates": [{"content": {"role": "model", "parts": [{"text": "stream"}]},
+                                     "finishReason": "STOP"}],
+                     "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 5,
+                                       "cachedContentTokenCount": 3, "thoughtsTokenCount": 2,
+                                       "totalTokenCount": 19}},
+                ]
+                body = "".join("data: " + json.dumps(c) + "\n\n" for c in chunks).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            parts = [{"text": "gemini reply"}]
+            if payload.get("tools"):
+                decl = payload["tools"][0]["functionDeclarations"][0]
+                parts = [{"functionCall": {"name": decl["name"], "args": {"query": "sla"}}}]
+            data = {
+                "responseId": "gem_resp_1",
+                "modelVersion": "gemini-2.5-pro",
+                "candidates": [{"content": {"role": "model", "parts": parts}, "finishReason": "STOP"}],
+                "usageMetadata": {
+                    "promptTokenCount": 12,
+                    "candidatesTokenCount": 5,
+                    "cachedContentTokenCount": 4,
+                    "thoughtsTokenCount": 3,
+                    "totalTokenCount": 20,
+                },
+            }
+        elif self.path == "/api/chat":
+            data = {
+                "model": payload["model"], "done": True, "done_reason": "stop",
+                "message": {"role": "assistant", "content": "ollama vision ok"},
+                "prompt_eval_count": 8, "eval_count": 2,
+            }
+        elif self.path == "/v1/chat/completions":
+            data = {
+                "id": "oai_1", "model": payload["model"],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "oai vision ok"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10},
+            }
+        else:
+            self.send_error(404)
+            return
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("X-Request-ID", "ext-req-1")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class GatewayExtendedProtocolsAndMultimodal(unittest.TestCase):
+    PNG_1X1 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temp.cleanup)
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), ExtendedProvider)
+        cls.addClassCleanup(upstream.server_close)
+        cls.upstream = upstream
+        upstream.calls = queue.Queue()
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        cls.addClassCleanup(upstream.shutdown)
+        base = f"http://127.0.0.1:{upstream.server_port}"
+        config = {
+            "token_env": "FIXTURE_GATEWAY_TOKEN",
+            "timeout_seconds": 5,
+            "endpoints": [
+                {"id": "claude-sonnet", "model": "claude-sonnet-4-5", "protocol": "anthropic",
+                 "base_url": base + "/v1", "api_key_env": "FIXTURE_PROVIDER_TOKEN"},
+                {"id": "gemini-pro", "model": "gemini-2.5-pro", "protocol": "gemini",
+                 "base_url": base + "/v1beta", "api_key_env": "FIXTURE_PROVIDER_TOKEN"},
+                {"id": "ollama-vl", "model": "qwen-vl", "protocol": "ollama", "base_url": base},
+                {"id": "oai-vl", "model": "gpt-4o", "protocol": "chat_completions",
+                 "base_url": base + "/v1", "api_key_env": "FIXTURE_PROVIDER_TOKEN"},
+            ],
+        }
+        service = gateway(config, cls.temp.name)
+        cls.port = service.__enter__()
+        cls.addClassCleanup(service.__exit__, None, None, None)
+        cls.auth = {"Authorization": "Bearer client-fixture-token"}
+
+    def test_anthropic_and_gemini_completion_tools_and_usage(self):
+        # Anthropic one-shot + system extraction + x-api-key + cached_tokens
+        status, _, reply = request(
+            self.port, "/v1/chat/completions",
+            {
+                "model": "claude-sonnet",
+                "messages": [
+                    {"role": "system", "content": "Be concise."},
+                    {"role": "user", "content": "Check SLA"},
+                ],
+                "max_tokens": 64,
+            },
+            self.auth,
+        )
+        self.assertEqual(status, 200, reply)
+        self.assertEqual(reply["choices"][0]["message"]["content"], "anthropic reply")
+        self.assertEqual(reply["usage"], {
+            "prompt_tokens": 15, "completion_tokens": 4, "total_tokens": 19, "cached_tokens": 5,
+        })
+        path, hdrs, sent = self.upstream.calls.get(timeout=1)
+        self.assertEqual(path, "/v1/messages")
+        self.assertEqual(hdrs["x-api-key"], "provider-fixture-token")
+        self.assertEqual(hdrs["anthropic-version"], "2023-06-01")
+        self.assertIsNone(hdrs["Authorization"])
+        self.assertEqual(sent["system"], "Be concise.")
+        self.assertEqual(sent["messages"], [{"role": "user", "content": "Check SLA"}])
+
+        # Gemini one-shot + x-goog-api-key + json_schema + cached & reasoning tokens
+        fmt = {"type": "json_schema", "json_schema": {"name": "out", "schema": {"type": "object"}}}
+        status, _, reply = request(
+            self.port, "/v1/chat/completions",
+            {
+                "model": "gemini-pro",
+                "messages": [
+                    {"role": "system", "content": "Output JSON"},
+                    {"role": "user", "content": "Check SLA"},
+                ],
+                "max_tokens": 64,
+                "response_format": fmt,
+            },
+            self.auth,
+        )
+        self.assertEqual(status, 200, reply)
+        self.assertEqual(reply["choices"][0]["message"]["content"], "gemini reply")
+        self.assertEqual(reply["usage"], {
+            "prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20,
+            "cached_tokens": 4, "reasoning_tokens": 3,
+        })
+        path, hdrs, sent = self.upstream.calls.get(timeout=1)
+        self.assertEqual(path, "/v1beta/models/gemini-2.5-pro:generateContent")
+        self.assertEqual(hdrs["x-goog-api-key"], "provider-fixture-token")
+        self.assertIsNone(hdrs["Authorization"])
+        self.assertEqual(sent["systemInstruction"], {"parts": [{"text": "Output JSON"}]})
+        self.assertEqual(sent["generationConfig"]["responseMimeType"], "application/json")
+
+        # Tool calls + multi-turn tool_result roundtrip for both Anthropic and Gemini
+        tools = [{"type": "function", "function": {
+            "name": "lookup_sla",
+            "description": "Lookup SLA",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+        }}]
+        for alias in ("claude-sonnet", "gemini-pro"):
+            status, _, reply = request(
+                self.port, "/v1/chat/completions",
+                {
+                    "model": alias,
+                    "messages": [{"role": "user", "content": "Find SLA"}],
+                    "max_tokens": 64,
+                    "tools": tools,
+                    "tool_choice": "required",
+                },
+                self.auth,
+            )
+            self.assertEqual(status, 200, reply)
+            self.assertEqual(reply["choices"][0]["finish_reason"], "tool_calls")
+            tc = reply["choices"][0]["message"]["tool_calls"][0]
+            self.assertEqual(tc["function"]["name"], "lookup_sla")
+            self.assertEqual(json.loads(tc["function"]["arguments"]), {"query": "sla"})
+            self.upstream.calls.get(timeout=1)
+
+            # Follow-up with assistant tool_calls + tool response
+            followup = [
+                {"role": "user", "content": "Find SLA"},
+                {"role": "assistant", "content": None, "tool_calls": [tc]},
+                {"role": "tool", "tool_call_id": tc["id"], "content": '{"sla":"99.9%"}'},
+            ]
+            status, _, _ = request(
+                self.port, "/v1/chat/completions",
+                {"model": alias, "messages": followup, "max_tokens": 64, "tools": tools},
+                self.auth,
+            )
+            self.assertEqual(status, 200)
+            self.upstream.calls.get(timeout=1)
+
+    def test_anthropic_and_gemini_sse_streaming(self):
+        for alias, expected_text in (("claude-sonnet", "anth stream"), ("gemini-pro", "gemini stream")):
+            conn = HTTPConnection("127.0.0.1", self.port, timeout=8)
+            try:
+                body = json.dumps({
+                    "model": alias,
+                    "messages": [{"role": "user", "content": "stream please"}],
+                    "max_tokens": 32,
+                    "stream": True,
+                }).encode()
+                conn.request("POST", "/v1/chat/completions", body,
+                             {"Content-Type": "application/json", **self.auth})
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                raw = resp.read().decode("utf-8")
+            finally:
+                conn.close()
+            self.upstream.calls.get(timeout=1)
+            events = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+            self.assertEqual(events[-1], "[DONE]")
+            chunks = [json.loads(e) for e in events[:-1]]
+            text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks if c.get("choices"))
+            self.assertEqual(text, expected_text)
+            self.assertIsNotNone(chunks[-1].get("usage"))
+
+    def test_multimodal_data_uri_conversion_and_ssrf_url_rejection(self):
+        # Reject remote HTTP/HTTPS URLs to prevent SSRF
+        bad_msg = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Inspect"},
+                {"type": "image_url", "image_url": {"url": "https://evil.example.com/pixel.png"}},
+            ],
+        }]
+        status, _, err = request(
+            self.port, "/v1/chat/completions",
+            {"model": "oai-vl", "messages": bad_msg, "max_tokens": 32},
+            self.auth,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(err["error"]["code"], "invalid_messages")
+        self.assertTrue(self.upstream.calls.empty())
+
+        # Valid base64 data URI converts cleanly across all 4 protocols
+        good_msg = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Inspect UI screenshot"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self.PNG_1X1}"}},
+            ],
+        }]
+        for alias in ("claude-sonnet", "gemini-pro", "ollama-vl", "oai-vl"):
+            status, _, reply = request(
+                self.port, "/v1/chat/completions",
+                {"model": alias, "messages": good_msg, "max_tokens": 32},
+                self.auth,
+            )
+            self.assertEqual(status, 200, reply)
+            _, _, sent = self.upstream.calls.get(timeout=1)
+            if alias == "claude-sonnet":
+                img_block = sent["messages"][0]["content"][1]
+                self.assertEqual(img_block["type"], "image")
+                self.assertEqual(img_block["source"]["media_type"], "image/png")
+                self.assertEqual(img_block["source"]["data"], self.PNG_1X1)
+            elif alias == "gemini-pro":
+                inline = sent["contents"][0]["parts"][1]["inlineData"]
+                self.assertEqual(inline["mimeType"], "image/png")
+                self.assertEqual(inline["data"], self.PNG_1X1)
+            elif alias == "ollama-vl":
+                self.assertEqual(sent["messages"][0]["images"], [self.PNG_1X1])
+            else:
+                self.assertEqual(sent["messages"][0]["content"][1]["type"], "image_url")
+
+
 if __name__ == "__main__":
     unittest.main()

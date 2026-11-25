@@ -1,6 +1,6 @@
 # 独立模型网关 Gateway
 
-Gateway 将一个已选定的端点别名和一组文本消息转成一次上游调用。目前支持 Ollama 原生协议与 HTTP Chat Completions 兼容协议。它的运行时只需要 Python 3.11+ 标准库和 JSON 配置，无需平台数据库、路由器或 worker。源码、独立镜像和本机编译程序提供相同的 HTTP 接口。[接口与内部设计](../../../docs/07-Gateway详细设计.md)
+Gateway 将一个已选定的端点别名和一组对话消息（含受控 Base64 图片多模态输入）转成一次上游调用。支持 4 种协议：`ollama`（Ollama 原生）、`chat_completions`（OpenAI Chat Completions 兼容）、`anthropic`（Anthropic Messages API）与 `gemini`（Google Gemini API）。它的运行时只需要 Python 3.11+ 标准库和 JSON 配置，无需平台数据库、路由器或 worker。源码、独立镜像和本机编译程序提供相同的 HTTP 接口。[接口与内部设计](../../../docs/07-Gateway详细设计.md)
 
 ## 在本机启动
 
@@ -30,7 +30,7 @@ curl -sS http://127.0.0.1:8765/v1/chat/completions \
 
 `GET /v1/models` 的 `data[].max_output_tokens` 是该端点的有效限制。工作台默认请求最多 1024 个输出 token，派发时允许网关采用更低的端点上限。直接 HTTP 客户端默认使用严格校验，需要同样行为时发送 `X-ClauseWeft-Token-Limit: clamp`。生成回执的 `gateway_metadata.max_output_tokens` 记录实际传给供应商的上限。对于 JSON 决策请求，`X-ClauseWeft-Output-Format: json` 启用 Ollama 的 `format: "json"` 和 `temperature=0`。
 
-`POST /v1/chat/completions` 同时支持原生 `tools`、`tool_choice`、`response_format`（`text`、`json_object`、`json_schema`）、`tool` / `assistant(tool_calls)` 多轮工具消息，以及 `stream: true` 标准化 SSE 流式输出（`text/event-stream`，适配 Chat Completions SSE 与 Ollama NDJSON）。上游回执携带缓存命中或推理统计时，网关在 `usage` 中保留 `cached_tokens` 与 `reasoning_tokens`。
+`POST /v1/chat/completions` 同时支持原生 `tools`、`tool_choice`、`response_format`（`text`、`json_object`、`json_schema`）、`tool` / `assistant(tool_calls)` 多轮工具消息、用户消息中的受控 Base64 `image_url` 多模态图片（拒绝外部 HTTP/HTTPS URL 防护 SSRF），以及 `stream: true` 标准化 SSE 流式输出（`text/event-stream`，统一适配 Chat Completions、Anthropic、Gemini 与 Ollama）。上游回执携带缓存命中或推理统计时，网关在 `usage` 中保留 `cached_tokens` 与 `reasoning_tokens`。
 
 若该端点可达，答复在 `choices[0].message.content`。配置入站令牌后，查询模型和生成时都需加 `-H "Authorization: Bearer $CLAUSEWEFT_GATEWAY_TOKEN"`。未设置令牌时只允许回环监听、本机 Host 与本机同源请求。公开健康检查不报告凭据或端点详情。
 

@@ -1,8 +1,77 @@
-"""Trusted, deployment-owned registrations for external coding agents."""
+"""Trusted, deployment-owned registrations and capability map for external coding agents."""
 
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 import re
+
+
+CAPABILITIES = {
+    "claude": {
+        "editable": True,
+        "read_only_guard": False,
+        "event_stream": True,
+        "usage_receipt": True,
+        "session_id": True,
+        "supports_continue": True,
+        "key_env": "ANTHROPIC_API_KEY",
+    },
+    "deepseek": {
+        "editable": False,
+        "read_only_guard": True,
+        "event_stream": True,
+        "usage_receipt": True,
+        "session_id": True,
+        "supports_continue": False,
+        "key_env": "DEEPSEEK_API_KEY",
+    },
+    "codex": {
+        "editable": True,
+        "read_only_guard": False,
+        "event_stream": True,
+        "usage_receipt": True,
+        "session_id": True,
+        "supports_continue": True,
+        "key_env": "OPENAI_API_KEY",
+    },
+    "gemini": {
+        "editable": True,
+        "read_only_guard": False,
+        "event_stream": True,
+        "usage_receipt": True,
+        "session_id": True,
+        "supports_continue": True,
+        "key_env": "GEMINI_API_KEY",
+    },
+    "kimi": {
+        "editable": True,
+        "read_only_guard": False,
+        "event_stream": True,
+        "usage_receipt": True,
+        "session_id": True,
+        "supports_continue": True,
+        "key_env": "MOONSHOT_API_KEY",
+    },
+    "opencode": {
+        "editable": True,
+        "read_only_guard": False,
+        "event_stream": True,
+        "usage_receipt": True,
+        "session_id": True,
+        "supports_continue": True,
+        "key_env": "OPENAI_API_KEY",
+    },
+}
+
+
+def capabilities_for(kind):
+    meta = CAPABILITIES.get(kind)
+    if not meta:
+        return {}
+    return {k: v for k, v in meta.items() if k != "key_env"}
+
+
+def is_editable_kind(kind):
+    return bool(CAPABILITIES.get(kind, {}).get("editable", False))
 
 
 @dataclass(frozen=True)
@@ -36,7 +105,7 @@ def load_runners(config):
         )
         if not all(isinstance(x, str) for x in (kind, image, executable, variable)):
             raise ValueError("执行器缺少配置")
-        if kind not in ("claude", "deepseek") or not re.fullmatch(
+        if kind not in CAPABILITIES or not re.fullmatch(
             "sha256:[0-9a-f]{64}", image
         ):
             raise ValueError("请指定受支持的 Agent 和本地镜像 ID")

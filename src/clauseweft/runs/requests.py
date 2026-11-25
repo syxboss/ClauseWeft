@@ -5,12 +5,13 @@ import re
 
 from clauseweft.storage import canonical
 
-from .materials import material_messages, validate_materials
+from .materials import attachment_parts, material_messages, validate_attachments, validate_materials
 
 
 TASK_FIELDS = {
     "text",
     "materials",
+    "attachments",
     "stage",
     "max_output_tokens",
     "required_capabilities",
@@ -35,6 +36,13 @@ def normalize_task(raw, mode):
     task.update(raw)
     if "materials" in task:
         validate_materials(task["materials"])
+    if "attachments" in task:
+        validate_attachments(task["attachments"])
+        if task["attachments"]:
+            caps = list(task["required_capabilities"])
+            if "vision" not in caps:
+                caps.append("vision")
+            task["required_capabilities"] = caps
     if type(task["max_output_tokens"]) is not int or not 1 <= task["max_output_tokens"] <= 1_000_000:
         raise ValueError("无效的输出上限")
     return task
@@ -65,21 +73,44 @@ def build_messages(task, definition, inputs, body):
         messages.append({"role": "system", "content": (
             f"技能 {skill['name']} ({skill['id']}@{skill['revision']})\n{skill['instructions']}"
         )})
+    for mem in body.get("memory_snapshots", []):
+        messages.append({"role": "system", "content": (
+            f"项目记忆 [{mem['category']}] {mem['title']} ({mem['id']}@{mem['revision']})\n{mem['content']}"
+        )})
     if definition.get("feedback"):
         messages.append({"role": "user", "content": "负责人的返工意见：" + definition["feedback"]})
     if definition.get("decision_feedback"):
         messages.append({"role": "user", "content": "上次决策未通过服务端校验：" + definition["decision_feedback"]})
-    for turn in body.get("conversation", {}).get("turns", []):
+    conversation = body.get("conversation", {})
+    if compaction := conversation.get("compaction"):
+        if compaction.get("summary"):
+            sources = ", ".join(compaction.get("source_run_ids", []))
+            messages.append({"role": "system", "content": (
+                f"较早对话摘要（已压缩 {compaction.get('compacted_turns', 0)} 轮，来源：{sources}）\n"
+                + compaction["summary"]
+            )})
+    for turn in conversation.get("turns", []):
         messages.extend(turn["messages"])
     if preference := body.get("personal_preferences"):
         messages.append({"role": "user", "content": "本次使用的个人偏好\n" + preference["instructions"]})
-    messages.append({"role": "user", "content": task["text"]})
+    if task.get("attachments"):
+        messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": task["text"]}, *attachment_parts(task["attachments"])],
+        })
+    else:
+        messages.append({"role": "user", "content": task["text"]})
     messages.extend(material_messages(task.get("materials", [])))
     adaptive = body.get("mode") == "tool" and "allowed_tools" in body
     for key, text in inputs.items():
         if adaptive:
             receipt = json.loads(text)
-            call = {"action": "tool", "tool_id": receipt["tool_id"], "arguments": receipt["arguments"]}
+            if "calls" in receipt:
+                call = {"action": "tools", "calls": [
+                    {"tool_id": c["tool_id"], "arguments": c["arguments"]} for c in receipt["calls"]
+                ]}
+            else:
+                call = {"action": "tool", "tool_id": receipt["tool_id"], "arguments": receipt["arguments"]}
             messages.append({"role": "assistant", "content": canonical(call)})
             text = "已批准并执行以上调用。工具返回的数据如下：\n" + text
         messages.append({"role": "user", "content": f"{key}\n{text}"})
@@ -99,11 +130,28 @@ def request_messages(store, body, n, refs, nodes):
     return build_messages(body["task"], definition, inputs, body)
 
 
+def _estimate_input_tokens(messages):
+    if not any(isinstance(m.get("content"), list) for m in messages):
+        return len(canonical(messages).encode()) + 16
+    total = 16
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if part.get("type") == "text":
+                    total += len(part.get("text", "").encode())
+                elif part.get("type") == "image_url":
+                    total += 1024
+        else:
+            total += len(canonical(msg).encode())
+    return total
+
+
 def route_snapshot(task, definition, messages, models, budget, currency, frozen=None):
     params = dict(
         task,
         stage=definition["stage"],
-        input_tokens=len(canonical(messages).encode()) + 16,
+        input_tokens=_estimate_input_tokens(messages),
         budget_micros=max(0, budget),
     )
     if any(skill["data_scope"] == "local_only" for skill in definition.get("skill_snapshots", [])):

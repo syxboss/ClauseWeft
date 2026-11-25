@@ -1,4 +1,8 @@
-const agentNames = {claude: "Claude Code", deepseek: "DeepSeek Harness"};
+const agentNames = {
+  claude: "Claude Code", deepseek: "DeepSeek Harness", codex: "Codex CLI",
+  gemini: "Gemini CLI", kimi: "Kimi Code", opencode: "OpenCode",
+};
+const editableKinds = new Set(["claude", "codex", "gemini", "kimi", "opencode"]);
 const agentStates = {queued:"排队中", running:"运行中", succeeded:"已完成", failed:"失败", cancelled:"已取消", interrupted:"执行中断"};
 
 function agentProject() {
@@ -65,13 +69,19 @@ function agentJobDetail(job) {
   const running = agentBusy(job);
   const back = '<a class="text-button" href="#agents">返回外部 Agent</a>';
   const buttons = running ? button("agent-cancel", "取消任务", job.id, "danger") : "";
-  const canFollowup = job.status === "succeeded" && job.kind === "claude";
+  const canFollowup = job.status === "succeeded" && editableKinds.has(job.kind);
   const review = canFollowup && job.patch ? button("agent-review", "用 DeepSeek 评审这份改动", job.id) : "";
   const cont = canFollowup ? button("agent-continue", "基于此候选继续修改", job.id) : "";
   const runTest = canFollowup ? button("agent-test", "运行容器验收测试", job.id) : "";
+  const addComment = canFollowup && job.patch ? button("agent-comment", "添加行级评论", job.id) : "";
+  const comments = job.comments || [];
+  const commentsSection = comments.length ? `<section class="record-section"><h2>行级评审评论（${comments.length}）</h2>
+    <ol class="agent-events">${comments.map(c =>
+      `<li><code>${esc(c.path)}:${esc(c.line)}</code> (${esc(c.side)}) — ${esc(c.body)}</li>`).join("")}</ol>
+    ${canFollowup ? `<div class="actions">${button("agent-continue-comments", "携带全部行级意见继续修改", job.id)}</div>` : ""}</section>` : "";
   const patch = job.patch ? `<section class="record-section"><h2>候选补丁</h2>
     <p>${(job.paths || []).map(p => `<code>${esc(p)}</code>`).join(" · ")}</p>
-    <div class="actions">${button("agent-download", "下载补丁", job.id)}${cont}${runTest}${review}</div>
+    <div class="actions">${button("agent-download", "下载补丁", job.id)}${addComment}${cont}${runTest}${review}</div>
     <pre class="agent-output" dir="auto">${esc(job.patch)}</pre></section>`
     : canFollowup ? `<section class="record-section"><h2>后续操作</h2><div class="actions">${cont}${runTest}</div></section>` : "";
   const reports = job.test_reports || [];
@@ -92,15 +102,15 @@ function agentJobDetail(job) {
     <div class="record-meta">${agentStatus(job.status)}<span>${esc(projectName(job.project_id))} · ${esc(job.repo_id)}</span><code title="${esc(job.base_sha)}">${esc((job.base_sha || "").slice(0, 12))}</code><time>${date(job.created)}</time></div>
     ${reference}<section class="record-section"><h2>任务目标</h2><p class="agent-prompt">${esc(job.prompt)}</p></section>
     <section class="record-section"><h2>运行记录</h2>${events.length ? `<ol class="agent-events">${events.map(event =>
-      `<li><time>${date(event.at, true)}</time> <span>${esc(eventLabels[event.type] || event.type)}</span> ${event.tool ? `<code>${esc(event.tool)}</code>` : ""}</li>`).join("")}</ol>` : "<p>等待第一条执行事件。</p>"}</section>${result}${testsSection}${receipt}${patch}</article>`;
+      `<li><time>${date(event.at, true)}</time> <span>${esc(eventLabels[event.type] || event.type)}</span> ${event.tool ? `<code>${esc(event.tool)}</code>` : ""}</li>`).join("")}</ol>` : "<p>等待第一条执行事件。</p>"}</section>${result}${testsSection}${commentsSection}${receipt}${patch}</article>`;
 }
-async function agentJobForm(projectId, source = null, mode = source ? "review" : "create") {
+async function agentJobForm(projectId, source = null, mode = source ? "review" : "create", includeComments = false) {
   const project = state.projects.find(item => item.id === projectId && item.status === "active");
   if (!project) throw Error("请选择一个活跃项目");
   const selection = await api("agent-jobs/options?project_id=" + encodeURIComponent(projectId));
   const isReview = mode === "review";
   const isContinue = mode === "continue";
-  const runners = selection.runners.filter(r => isReview ? r.kind === "deepseek" : isContinue ? r.kind === "claude" : true);
+  const runners = selection.runners.filter(r => isReview ? r.kind === "deepseek" : isContinue ? editableKinds.has(r.kind) : true);
   const repos = selection.repositories.filter(r => !source || r.id === source.repo_id);
   if (!runners.length || !repos.length) throw Error(isReview ? "该项目需要可用的 DeepSeek 执行器和来源仓库授权。" : isContinue ? "该项目需要可用的 Claude Code 执行器和来源仓库授权。" : agentConfigNote(selection));
   const choices = runners.map(r => [r.id, (agentNames[r.kind] || r.kind) + " · " + r.id]);
@@ -122,7 +132,10 @@ async function agentJobForm(projectId, source = null, mode = source ? "review" :
     if (!data.allow_external) throw Error("请确认外部处理范围");
     const request = {project_id:projectId, runner_id:data.runner_id, prompt:data.prompt.trim(), repo_id:source?.repo_id || data.repo_id};
     if (isReview) request.review_of = source.id;
-    else if (isContinue) request.continue_from = source.id;
+    else if (isContinue) {
+      request.continue_from = source.id;
+      if (includeComments) request.include_comments = true;
+    }
     else request.base_sha = data.base_sha.trim();
     if (data.suite_id) {
       request.suite_id = data.suite_id;
@@ -153,7 +166,27 @@ Object.assign(actions, {
   },
   "agent-continue": async id => {
     const source = await api(agentPath(id));
-    return agentJobForm(source.project_id, source, "continue");
+    return agentJobForm(source.project_id, source, "continue", false);
+  },
+  "agent-continue-comments": async id => {
+    const source = await api(agentPath(id));
+    return agentJobForm(source.project_id, source, "continue", true);
+  },
+  "agent-comment": async id => {
+    const job = await api(agentPath(id));
+    const paths = job.paths || [];
+    if (!paths.length) throw Error("当前候选补丁没有可评论的文件");
+    const body = field("path", "文件", paths[0], "select", {options: paths.map(p => [p, p]), required: true})
+      + field("line", "行号", 1, "number", {min: 1, max: 1000000, step: 1, required: true})
+      + field("side", "位置", "new", "select", {options: [["new", "修改后（new）"], ["old", "修改前（old）"]]})
+      + field("body", "评审意见", "", "textarea", {rows: 3, required: true});
+    form("添加行级评审评论", body, async data => {
+      await api(agentPath(id) + "/comments", "POST", {
+        path: data.path, line: Number(data.line), side: data.side || "new", body: data.body.trim(),
+      });
+      closeSheet();
+      await render();
+    }, "保存评论");
   },
   "agent-test": async id => {
     const job = await api(agentPath(id));
