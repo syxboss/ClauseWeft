@@ -38,6 +38,14 @@ def current_scope(app, body):
             return "blocked"
         if skill["data_scope"] == "local_only":
             restricted = True
+    if any(m.get("data_scope") == "local_only" for m in body.get("memory_snapshots", [])):
+        restricted = True
+    for server_id, expected_digest in body.get("mcp_digests", {}).items():
+        srv = app.mcp_servers.get(server_id)
+        if not srv or srv["digest"] != expected_digest:
+            return "blocked"
+        if srv["data_scope"] == "local_only":
+            restricted = True
     if body.get("repo_id"):
         repo = app.delivery.repositories.get(body["repo_id"])
         if (

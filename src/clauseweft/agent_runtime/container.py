@@ -62,16 +62,18 @@ def main():
     env = {"HOME":str(home), "PATH":"/usr/local/bin:/usr/bin:/bin", "LANG":"C.UTF-8", "TMPDIR":str(tmp)}
     argv = data["argv"]
     prompt = data["prompt"]
-    claude = data["kind"] == "claude"
-    if claude:
-        env["ANTHROPIC_API_KEY"] = data["key"]
-        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    editable = data.get("editable", data["kind"] == "claude")
+    key_env = data.get("key_env") or ("ANTHROPIC_API_KEY" if editable else "DEEPSEEK_API_KEY")
+    if editable:
+        env[key_env] = data["key"]
+        if data["kind"] == "claude":
+            env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         for name, content in data["files"].items():
             path = work / name
             path.parent.mkdir(exist_ok=True, parents=True)
             path.write_bytes(base64.b64decode(content, validate=True))
     else:
-        env["DEEPSEEK_API_KEY"] = data["key"]
+        env[key_env] = data["key"]
         env["DSH_HOME"] = str(home / ".dsh")
         # Load the image's pinned native addon directly; /tmp is noexec.
         env["NARB_DISABLE_NATIVE_CACHE"] = "1"
@@ -86,11 +88,11 @@ def main():
         prompt = json.dumps({"review_request": prompt, "source_files":sources}, ensure_ascii=False)
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, cwd=work, env=env, start_new_session=True)
-    if claude:
+    if editable:
         proc.stdin.write(prompt.encode("utf-8"))
         proc.stdin.close()
     total = 0
-    admitted = claude
+    admitted = editable
     while True:
         row = proc.stdout.readline(1024*1024 + 1)
         if not row: break
@@ -105,7 +107,7 @@ def main():
         if row.strip():
             send("cli", json.loads(row))
     if proc.wait() != 0 or not admitted: sys.exit(1)
-    if claude:
+    if editable:
         # Reap outstanding helpers before collecting files. PID 1 exiting
         # also tears down every process in this private PID namespace.
         try: os.killpg(proc.pid, signal.SIGKILL)

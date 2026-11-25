@@ -13,7 +13,7 @@ from clauseweft.usage import Usage
 from clauseweft.catalog import Catalog, GatewayFailure
 from clauseweft.runs import Runs
 from clauseweft.storage import Store
-from . import access_policy, audit_evidence, evaluation_routes, personal_preferences, run_planning, run_routes
+from . import access_policy, audit_evidence, evaluation_routes, personal_preferences, project_memory, run_planning, run_routes
 from .agent_jobs import AgentJobs
 from .delivery import Delivery
 from .http_contracts import Problem, encode, ident, match, page, require_object
@@ -25,9 +25,10 @@ class Application:
         self.root = Path(state).resolve()
         cfg = json.loads(Path(config).read_text(encoding="utf-8")) if config else {}
         require_object(
-            cfg, ("workspace_id", "gateways", "repositories", "suites", "data_scope", "project_references", "agent_runners")
+            cfg, ("workspace_id", "gateways", "repositories", "suites", "data_scope",
+                  "project_references", "agent_runners", "mcp_servers")
         )
-        for section in ("gateways", "repositories", "suites", "project_references"):
+        for section in ("gateways", "repositories", "suites", "project_references", "mcp_servers"):
             entries = cfg.get(section, {})
             if not isinstance(entries, dict) or any(
                 not isinstance(key, str) or not key or not isinstance(v, dict)
@@ -35,6 +36,7 @@ class Application:
             ):
                 raise ValueError(f"{section} 必须为资源 ID 到配置的映射")
         self.references = project_tools.load_references(cfg.get("project_references", {}))
+        self.mcp_servers = project_tools.load_mcp_servers(cfg.get("mcp_servers", {}))
         for gateway in cfg.get("gateways", {}).values():
             require_object(gateway, ("url", "token_env"), ("url",))
             if not isinstance(gateway["url"], str):
@@ -104,6 +106,7 @@ class Application:
             )
             self.platform.init_schema(db)
             personal_preferences.init_schema(db)
+            project_memory.init_schema(db)
             self.harness.init_schema(db)
             self.delivery.init_schema(db)
             self.agent_jobs.init_schema(db)
@@ -446,6 +449,12 @@ class Application:
                 return item
             if len(p) == 3 and p[0] == "templates" and p[2] == "versions":
                 return page(self.platform.versions(db, p[1]), q)
+            if len(p) == 3 and p[0] == "projects" and p[2] == "memories":
+                self.platform.get(db, "projects", p[1])
+                return page(project_memory.list_memories(db, p[1], q), q)
+            if len(p) == 4 and p[0] == "projects" and p[2] == "memories":
+                self.platform.get(db, "projects", p[1])
+                return project_memory.get(db, p[1], p[3])
             if len(p) == 3 and p[2] == "history":
                 self.platform.get(db, p[0], p[1])
                 return page(audit.history(db, p[0], p[1]), q)
@@ -545,6 +554,12 @@ class Application:
             ):
                 require_object(data, ())
                 return 200, self.platform.publish(db, p[1], expected, self.actor())
+            if method == "POST" and len(p) == 3 and p[0] == "projects" and p[2] == "memories":
+                project = self.platform.get(db, "projects", p[1])
+                return 201, project_memory.create(db, project, data, self.actor())
+            if method == "PATCH" and len(p) == 4 and p[0] == "projects" and p[2] == "memories":
+                project = self.platform.get(db, "projects", p[1])
+                return 200, project_memory.update(db, project, p[3], data, expected, self.actor())
         if method == "POST" and p == ("endpoints",):
             eid = data.get("endpoint_id")
             if any(m["endpoint_id"] == eid for m in self.catalog.list()):
@@ -612,7 +627,12 @@ class Application:
     def work(self, stop):
         while not stop.is_set():
             try:
-                if self.delivery.work_once() or self.runs.work_once() or self.agent_jobs.work_once(stop):
+                if (
+                    self.delivery.work_once()
+                    or self.runs.work_once()
+                    or self.agent_jobs.work_once(stop)
+                    or self.agent_jobs.work_sop_agent_once(stop)
+                ):
                     continue
             except (sqlite3.OperationalError, RuntimeError, ValueError, OSError) as exc:
                 print(f"工作线程暂缓 {type(exc).__name__}", file=sys.stderr)

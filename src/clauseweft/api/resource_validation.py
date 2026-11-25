@@ -165,10 +165,18 @@ def _validate_template(platform, db, result, workspace):
         "group",
         "prompt",
         "pinned_endpoint",
+        "runner_id",
+        "repo_id",
+        "base_sha",
     }
     for node in result["nodes"]:
         if node.keys() - editable_node_fields:
             raise ValueError("SOP 节点包含服务端保管或不支持的字段")
+        if node.get("kind") == "agent":
+            if node.get("runner_id") not in platform.app.agent_jobs.runners:
+                raise ValueError("SOP agent 节点须引用已登记的外部执行器")
+            if node.get("repo_id") not in workspace["repository_ids"]:
+                raise ValueError("SOP agent 节点仓库须在工作空间授权范围内")
         if (
             node.get("pinned_endpoint")
             and node["pinned_endpoint"] not in workspace["endpoint_ids"]

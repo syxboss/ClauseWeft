@@ -19,11 +19,16 @@ from uuid import uuid4
 
 from clauseweft.workspace import portable_path
 from clauseweft.workspace.credentials import contains
-from .config import AgentRuntimeError, Runner, load_runners
+from .config import (
+    CAPABILITIES, AgentRuntimeError, Runner, capabilities_for, is_editable_kind, load_runners,
+)
 from .container import SCRIPT, review_gate
 from .protocol import Response
 
-__all__ = ["AgentRuntimeError", "Runner", "load_runners", "run_agent"]
+__all__ = [
+    "CAPABILITIES", "AgentRuntimeError", "Runner", "capabilities_for",
+    "is_editable_kind", "load_runners", "run_agent",
+]
 
 _MAX_TREE = 2 * 1024 * 1024
 
@@ -136,6 +141,14 @@ def _cli(runner):
             "--disable-slash-commands",
             "--no-session-persistence",
         ]
+    if runner.kind == "codex":
+        return [runner.executable, "exec", "--json", "--sandbox", "workspace-write", "-"]
+    if runner.kind == "gemini":
+        return [runner.executable, "-p", "-", "--output-format", "stream-json", "--approval-mode", "auto_edit"]
+    if runner.kind == "kimi":
+        return [runner.executable, "--print", "--output-format", "stream-json", "-"]
+    if runner.kind == "opencode":
+        return [runner.executable, "run", "--format", "json", "-"]
     return [
         runner.executable,
         "--profile",
@@ -306,7 +319,8 @@ def run_agent(
     workspace = Path(workspace)
     before = _read_tree(workspace, key)
     name = "clauseweft-agent-" + uuid4().hex
-    editable = runner.kind == "claude"
+    editable = is_editable_kind(runner.kind)
+    key_env = CAPABILITIES[runner.kind]["key_env"]
     response = Response(runner.kind, key, on_event)
     try:
         client, env = _docker_context(runner)
@@ -345,6 +359,8 @@ def run_agent(
                 json.dumps(
                     {
                         "kind": runner.kind,
+                        "editable": editable,
+                        "key_env": key_env,
                         "argv": _cli(runner),
                         "review_gate": review_gate() if not editable else None,
                         "key": key,

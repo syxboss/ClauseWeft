@@ -116,8 +116,8 @@ def _endpoint(raw, max_tokens):
             or any(ord(c) < 32 for c in model)):
         raise ValueError("端点 model 必须是非空模型标识")
     protocol = raw.get("protocol")
-    if protocol not in ("ollama", "chat_completions"):
-        raise ValueError("protocol 必须是 ollama 或 chat_completions")
+    if protocol not in ("ollama", "chat_completions", "anthropic", "gemini"):
+        raise ValueError("protocol 必须是 ollama、chat_completions、anthropic 或 gemini")
     allow_insecure = raw.get("allow_insecure_http", False)
     if type(allow_insecure) is not bool:
         raise ValueError("allow_insecure_http 必须是布尔值")

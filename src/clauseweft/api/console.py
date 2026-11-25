@@ -8,9 +8,8 @@ from .console_app import SCRIPT
 from .console_styles import STYLE
 from .web import load_assets
 
-WORDMARK = '<span class="signal-mark" aria-hidden="true"><i></i><i></i><i></i></span>ClauseWeft'
-SIGNAL_SCRIPT = load_assets("scripts/signal.js")
-BROWSER_SCRIPT = SIGNAL_SCRIPT + "\n" + SCRIPT + "\n"
+WORDMARK = '<span class="signal-mark" aria-hidden="true"><i></i><i></i></span>ClauseWeft'
+BROWSER_SCRIPT = SCRIPT + "\n"
 SCRIPT_HASH = "sha256-" + b64encode(sha256(BROWSER_SCRIPT.encode("utf-8")).digest()).decode("ascii")
 PAGE = Template(load_assets("page.html")).substitute(
     wordmark=WORDMARK,

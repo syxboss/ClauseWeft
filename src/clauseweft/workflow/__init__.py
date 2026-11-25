@@ -56,7 +56,7 @@ def compile(body):
         nodes = [tool_decision_node(body, 1)]
     elif mode == "tool":
         propose = node("propose", "general")
-        propose.update(label="拟定工具参数", prompt=proposal_prompt(body.get("tool_id")))
+        propose.update(label="拟定工具参数", prompt=proposal_prompt(body.get("tool_id"), body))
         confirm = node("confirm", "general", ["propose"], gate=True)
         confirm["label"] = "确认并执行工具"
         answer = node("answer", "general", ["confirm"])
@@ -155,9 +155,9 @@ def compile_sop(raw):
             raise ValueError("SOP 节点须为对象")
         definition = deepcopy(item)
         kind = definition.get("kind", "model")
-        if kind not in ("model", "gate"):
-            raise ValueError("SOP 节点类型须为 model 或 gate")
-        stage = definition.get("stage", "review")
+        if kind not in ("model", "gate", "agent"):
+            raise ValueError("SOP 节点类型须为 model、gate 或 agent")
+        stage = definition.get("stage", "code" if kind == "agent" else "review")
         if stage not in ("auto", "general", "requirements", "review", "code", "test"):
             raise ValueError("SOP 节点阶段无效")
         definition.update(kind=kind, stage=stage)
@@ -166,6 +166,15 @@ def compile_sop(raw):
         definition.setdefault("prompt", "")
         if not isinstance(definition["prompt"], str) or len(definition["prompt"]) > 32000:
             raise ValueError("Agent 提示须为不超过 32000 字符的文本")
+        if kind == "agent":
+            if (not isinstance(definition.get("runner_id"), str) or not definition["runner_id"].strip()
+                    or not isinstance(definition.get("repo_id"), str) or not definition["repo_id"].strip()):
+                raise ValueError("SOP agent 节点须指定 runner_id 与 repo_id")
+            if "pinned_endpoint" in definition:
+                raise ValueError("SOP agent 节点不能设置 pinned_endpoint")
+            definition.setdefault("base_sha", "HEAD")
+            if not isinstance(definition["base_sha"], str) or not definition["base_sha"].strip():
+                raise ValueError("SOP agent 节点 base_sha 无效")
         if definition["group"] is not None and (
             kind != "model" or not isinstance(definition["group"], str)
             or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", definition["group"])

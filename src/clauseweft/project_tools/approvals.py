@@ -1,14 +1,24 @@
-"""Review proposed calls and commit approved effects with their run receipt."""
+"""Review proposed calls (single, batch, or MCP) and commit approved effects with their run receipt."""
 
 import json
 
 from clauseweft import audit
 
 from .decisions import (
-    TOOL_RISKS, TOOLS, arguments, checked_arguments, checked_text, is_read_only,
-    read_decision, uses_reference,
+    arguments, checked_arguments, checked_text, is_read_only, read_decision,
+    tool_label, tool_risk, uses_reference,
 )
+from .mcp import call_mcp_tool, is_mcp_tool, parse_mcp_tool
 from .references import search
+
+
+def _batch_risk(calls, body):
+    risks = [tool_risk(c["id"], body) for c in calls]
+    if "external_effect" in risks:
+        return "external_effect"
+    if any(r != "read_only" for r in risks):
+        return "mutating"
+    return "read_only"
 
 
 def review(app, run):
@@ -18,22 +28,58 @@ def review(app, run):
             return None
         proposal = next(n for n in run["nodes"] if n["node_id"] == gate["dependencies"][0])
         value = read_decision(app.store.read_blob(proposal["artifact"]))
+        if value.get("action") == "tools":
+            calls = [
+                {
+                    "id": item["tool_id"],
+                    "name": tool_label(item["tool_id"], run),
+                    "risk": tool_risk(item["tool_id"], run),
+                    "arguments": checked_arguments(item["tool_id"], item["arguments"], body=run),
+                }
+                for item in value["calls"]
+            ]
+            return {
+                "id": "batch",
+                "name": "并行工具调用（" + "、".join(c["name"] for c in calls) + "）",
+                "risk": _batch_risk(calls, run),
+                "calls": calls,
+                "proposal_ref": proposal["artifact"],
+                "gate_id": gate["node_id"],
+                "node_id": proposal["node_id"],
+            }
         tool = value["tool_id"]
-        return {"id": tool, "name": TOOLS[tool][0], "risk": TOOL_RISKS[tool],
-                "arguments": checked_arguments(tool, value["arguments"]),
-                "proposal_ref": proposal["artifact"], "gate_id": gate["node_id"], "node_id": proposal["node_id"]}
+        return {
+            "id": tool, "name": tool_label(tool, run), "risk": tool_risk(tool, run),
+            "arguments": checked_arguments(tool, value["arguments"], body=run),
+            "proposal_ref": proposal["artifact"], "gate_id": gate["node_id"], "node_id": proposal["node_id"],
+        }
     proposal = next(node for node in run["nodes"] if node["node_id"] == "propose")
-    result = {"id": run["tool_id"], "name": TOOLS[run["tool_id"]][0], "risk": TOOL_RISKS[run["tool_id"]],
-              "proposal_ref": proposal["artifact"], "gate_id": "confirm", "node_id": "propose"}
+    result = {
+        "id": run["tool_id"], "name": tool_label(run["tool_id"], run),
+        "risk": tool_risk(run["tool_id"], run),
+        "proposal_ref": proposal["artifact"], "gate_id": "confirm", "node_id": "propose",
+    }
     if proposal["artifact"]:
         try:
-            result["arguments"] = arguments(run["tool_id"], app.store.read_blob(proposal["artifact"]))
+            result["arguments"] = arguments(run["tool_id"], app.store.read_blob(proposal["artifact"]), body=run)
         except (ValueError, OSError, RuntimeError) as exc:
             result["error"] = str(exc)
     return result
 
 
+def _check_mcp_binding(app, run, tool_id):
+    server_id, tool_name = parse_mcp_tool(tool_id)
+    server = app.mcp_servers.get(server_id)
+    digests = run.get("mcp_digests", {})
+    if not server or server["digest"] != digests.get(server_id) or tool_name not in server["tools"]:
+        raise RuntimeError("MCP 服务配置已变更，请重新发起工具任务")
+    return server, tool_name
+
+
 def _execute_tool(app, db, run, project, actor, tool, args, dynamic, source):
+    if is_mcp_tool(tool):
+        server, tool_name = _check_mcp_binding(app, run, tool)
+        return call_mcp_tool(server, tool_name, args)
     if tool == "create_requirement":
         existing = None
         if dynamic:
@@ -58,8 +104,20 @@ def _execute_tool(app, db, run, project, actor, tool, args, dynamic, source):
             "query": args["query"], "items": search(source["docs"].values(), args["query"])}
 
 
+def _execute_evidence(app, db, run, project, actor, evidence, dynamic, source, details):
+    if "calls" in evidence:
+        executed = []
+        for call in evidence["calls"]:
+            out = _execute_tool(app, db, run, project, actor, call["id"], call["arguments"], dynamic, source)
+            executed.append({"tool_id": call["id"], "arguments": call["arguments"], "result": out})
+        return dict(details, calls=executed, results=[item["result"] for item in executed])
+    args = evidence["arguments"]
+    output = _execute_tool(app, db, run, project, actor, evidence["id"], args, dynamic, source)
+    return dict(details, arguments=args, result=output)
+
+
 def auto_approve(app, run_id):
-    """Automatically execute a pending read-only tool gate when policy allows."""
+    """Automatically execute a pending read-only tool gate (single or batch) when policy allows."""
     with app.store.transaction() as db:
         row = db.execute("SELECT body, status FROM runs WHERE run_id=?", (run_id,)).fetchone()
         if not row or row["status"] != "needs_input":
@@ -69,9 +127,14 @@ def auto_approve(app, run_id):
             return False
         run = app.platform.enrich_run(db, app.runs.get(run_id))
         evidence = review(app, run)
-        if (not evidence or "error" in evidence or not is_read_only(evidence["id"])
+        if (not evidence or "error" in evidence
                 or not any(n["state"] == "needs_input" and n["node_id"] == evidence["gate_id"]
                            for n in run["nodes"])):
+            return False
+        if "calls" in evidence:
+            if not all(is_read_only(c["id"], run) for c in evidence["calls"]):
+                return False
+        elif not is_read_only(evidence["id"], run):
             return False
         creator = run.get("created_by")
         try:
@@ -84,14 +147,14 @@ def auto_approve(app, run_id):
         source = app.references.get(project["id"])
         if uses_reference(run) and (not source or source["digest"] != run.get("reference_digest")):
             return False
-        tool = evidence["id"]
-        args = evidence["arguments"]
         dynamic = "allowed_tools" in run
-        details = dict(tool_id=tool, proposal_ref=evidence["proposal_ref"], node_id=evidence["gate_id"],
+        details = dict(tool_id=evidence["id"], proposal_ref=evidence["proposal_ref"], node_id=evidence["gate_id"],
                        actor=actor["id"], project_id=project["id"],
                        reason="只读工具按分级策略自动执行", auto_approved=True)
-        output = _execute_tool(app, db, run, project, actor, tool, args, dynamic, source)
-        receipt = dict(details, arguments=args, result=output)
+        try:
+            receipt = _execute_evidence(app, db, run, project, actor, evidence, dynamic, source, details)
+        except RuntimeError:
+            return False
         app.store.event(db, run_id, "tool_auto_approved", details)
         app.store.event(db, run_id, "tool_executed", details)
         audit.record(db, audit.SYSTEM, "tool.auto_approved", f"runs/{run_id}/gates/{evidence['gate_id']}",
@@ -126,7 +189,6 @@ def decide(app, db, run, data):
     if action == "revise":
         app.store.event(db, rid, "tool_revision_requested", details)
         if dynamic:
-            # This pending gate has no executed receipt or successors yet.
             db.execute("DELETE FROM nodes WHERE run_id=? AND node_id=? AND state='needs_input'", (rid, evidence["gate_id"]))
         return app.runs.invalidate(rid, evidence["node_id"], feedback=reason)
     if action != "approve":
@@ -138,8 +200,6 @@ def decide(app, db, run, data):
     source = app.references.get(project["id"])
     if uses_reference(run) and (not source or source["digest"] != run.get("reference_digest")):
         raise RuntimeError("项目资料源已变更，请重新发起工具任务")
-    args = evidence["arguments"]
-    output = _execute_tool(app, db, run, project, actor, tool, args, dynamic, source)
-    receipt = dict(details, arguments=args, result=output)
+    receipt = _execute_evidence(app, db, run, project, actor, evidence, dynamic, source, details)
     app.store.event(db, rid, "tool_executed", details)
     return app.runs.gate(rid, evidence["gate_id"], receipt)

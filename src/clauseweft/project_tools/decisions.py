@@ -2,6 +2,8 @@
 
 import json
 
+from .mcp import is_mcp_tool, parse_mcp_tool
+
 
 TOOLS = {
     "search_requirements": ("检索项目需求", '{"query":"一个具体关键词"}'),
@@ -19,8 +21,35 @@ TOOL_RISKS = {
 APPROVAL_POLICIES = ("always", "auto_read_only")
 
 
-def is_read_only(tool_id):
-    return TOOL_RISKS.get(tool_id) == "read_only"
+def tool_risk(tool_id, body=None):
+    if tool_id in TOOL_RISKS:
+        return TOOL_RISKS[tool_id]
+    meta = (body or {}).get("mcp_tools", {}).get(tool_id)
+    return meta["risk"] if meta else "mutating"
+
+
+def tool_label(tool_id, body=None):
+    if tool_id in TOOLS:
+        return TOOLS[tool_id][0]
+    meta = (body or {}).get("mcp_tools", {}).get(tool_id)
+    return meta["description"] if meta else tool_id
+
+
+def is_read_only(tool_id, body=None):
+    return tool_risk(tool_id, body) == "read_only"
+
+
+def _known_tool(tool_id, mcp_servers=None, body=None):
+    if tool_id in TOOLS:
+        return True
+    if not is_mcp_tool(tool_id):
+        return False
+    if body and tool_id in body.get("mcp_tools", {}):
+        return True
+    if mcp_servers:
+        server_id, name = parse_mcp_tool(tool_id)
+        return server_id in mcp_servers and name in mcp_servers[server_id]["tools"]
+    return False
 
 
 def checked_text(value, limit, name):
@@ -30,28 +59,37 @@ def checked_text(value, limit, name):
     return value.strip()
 
 
-def proposal_prompt(tool_id):
-    if not isinstance(tool_id, str) or tool_id not in TOOLS:
+def proposal_prompt(tool_id, body=None):
+    if not isinstance(tool_id, str):
         raise ValueError("请选择已登记的项目工具")
-    name, schema = TOOLS[tool_id]
-    prompt = f"为用户选定的工具「{name}」拟定参数。只返回一个符合此结构的 JSON 对象：{schema}。"
-    if tool_id == "create_requirement":
-        prompt += "priority 取 low、medium 或 high。"
-    return prompt + "等待负责人确认后才执行。"
+    if tool_id in TOOLS:
+        name, schema = TOOLS[tool_id]
+        prompt = f"为用户选定的工具「{name}」拟定参数。只返回一个符合此结构的 JSON 对象：{schema}。"
+        if tool_id == "create_requirement":
+            prompt += "priority 取 low、medium 或 high。"
+        return prompt + "等待负责人确认后才执行。"
+    meta = (body or {}).get("mcp_tools", {}).get(tool_id)
+    if meta:
+        schema = json.dumps(meta.get("parameters", {"type": "object"}), ensure_ascii=False, separators=(",", ":"))
+        return f"为用户选定的 MCP 工具「{meta['description']}」({tool_id}) 拟定参数。只返回一个符合此 JSON Schema 的对象：{schema}。等待负责人确认后才执行。"
+    raise ValueError("请选择已登记的项目工具")
 
 
-def validate_plan(data):
+def validate_plan(data, mcp_servers=None):
     policy = data.get("tool_approval_policy", "always")
     if not isinstance(policy, str) or policy not in APPROVAL_POLICIES:
         raise ValueError("工具审批策略须为 always 或 auto_read_only")
     if "allowed_tools" not in data:
         if "max_tool_steps" in data or "requirement_query" in data:
             raise ValueError("多步工具设置需要 allowed_tools")
-        proposal_prompt(data.get("tool_id"))
+        tid = data.get("tool_id")
+        if not _known_tool(tid, mcp_servers=mcp_servers, body=data):
+            raise ValueError("请选择已登记的项目工具")
         return
     tools = data["allowed_tools"]
-    if ("tool_id" in data or not isinstance(tools, list) or not 1 <= len(tools) <= len(TOOLS)
-            or any(not isinstance(k, str) or k not in TOOLS for k in tools) or len(set(tools)) != len(tools)):
+    if ("tool_id" in data or not isinstance(tools, list) or not 1 <= len(tools) <= 32
+            or any(not isinstance(k, str) or not _known_tool(k, mcp_servers=mcp_servers, body=data) for k in tools)
+            or len(set(tools)) != len(tools)):
         raise ValueError("allowed_tools 须为本次允许使用的已登记工具，不能重复或同时指定 tool_id")
     steps = data.setdefault("max_tool_steps", 4)
     if type(steps) is not int or not 1 <= steps <= 8:
@@ -88,13 +126,17 @@ def decision_prompt(body, step, last_receipt=None):
         "search_reference": "search_reference 检索知识库。arguments 只含 query，使用用户给的关键词。",
         "create_requirement": "create_requirement 申请新建需求。arguments 必填 title、description、priority。标题和验收条件取自用户原文；优先级取 low、medium 或 high。",
     }
-    prompt = (format_rule + '\n申请工具时输出 {"action":"tool","tool_id":"所选标识","arguments":{参数}}。'
-              "只做当前这一步，按用户写明的先后顺序执行。权限清单：\n"
+    for tid, meta in body.get("mcp_tools", {}).items():
+        schema_str = json.dumps(meta.get("parameters", {"type": "object"}), ensure_ascii=False, separators=(",", ":"))
+        schemas[tid] = f"{tid}（MCP 工具，风险={meta['risk']}）：{meta['description']}。arguments 须符合 {schema_str}。"
+    prompt = (format_rule + '\n申请单个工具时输出 {"action":"tool","tool_id":"所选标识","arguments":{参数}}；'
+              '若需并行调用多个独立工具（最多 4 个），可输出 {"action":"tools","calls":[{"tool_id":"...","arguments":{...}}]}。'
+              "权限清单：\n"
               + "\n".join(schemas[key] for key in body["allowed_tools"]))
     if not last_receipt:
-        return prompt + "\n目前没有已执行的动作。按用户的第一项要求选择一个工具，等待结果。"
-    output = last_receipt["result"]
-    if "items" in output:
+        return prompt + "\n目前没有已执行的动作。按用户的第一项要求选择一个或多个工具，等待结果。"
+    output = last_receipt.get("result")
+    if isinstance(output, dict) and "items" in output:
         prompt += f"\n上一步是检索，命中 {len(output['items'])} 项。"
         if not output["items"]:
             prompt += "相同的检索已经返回空结果。若用户要求缺失时新建，下一步应调用 create_requirement，原样采用用户指定的标题、优先级与验收条件。"
@@ -150,15 +192,34 @@ def decision(body, raw, receipts):
             if not any(record["id"] in answer for record in (records or [receipts[-1]["result"]])):
                 raise InvalidDecision("最终答复须引用真实需求 ID，请从已执行的工具回执中完整复制")
         return {"answer": answer}
+    if value.get("action") == "tools" and set(value) == {"action", "calls"}:
+        if query:
+            raise InvalidDecision("查重模式须按步骤单次调用工具")
+        raw_calls = value["calls"]
+        if not isinstance(raw_calls, list) or not 1 <= len(raw_calls) <= 4:
+            raise InvalidDecision("并行工具 calls 须包含 1 至 4 项调用")
+        used = sum(len(r.get("calls", [1])) for r in receipts)
+        if used + len(raw_calls) > body["max_tool_steps"]:
+            raise InvalidDecision("已到工具执行次数上限，请依据现有回执给出最终答复", "tool_step_limit")
+        validated = []
+        for item in raw_calls:
+            if not isinstance(item, dict) or set(item) != {"tool_id", "arguments"}:
+                raise InvalidDecision("并行工具每项须包含 tool_id 与 arguments")
+            tid = item["tool_id"]
+            if tid not in body["allowed_tools"]:
+                raise InvalidDecision("所提议的工具超出本次授权范围")
+            validated.append({"id": tid, "arguments": checked_arguments(tid, item["arguments"], body=body)})
+        return {"calls": validated}
     if value.get("action") != "tool" or set(value) != {"action", "tool_id", "arguments"}:
         raise InvalidDecision("决策须包含完整的工具提议或最终答复")
-    if len(receipts) >= body["max_tool_steps"]:
+    used = sum(len(r.get("calls", [1])) for r in receipts)
+    if used >= body["max_tool_steps"]:
         raise InvalidDecision("已到工具执行次数上限，请依据现有回执给出最终答复", "tool_step_limit")
     tool = value["tool_id"]
     if tool not in body["allowed_tools"]:
         raise InvalidDecision("所提议的工具超出本次授权范围")
-    args = checked_arguments(tool, value["arguments"])
-    if not query and tool == "create_requirement" and receipts and receipts[-1]["tool_id"] == "search_requirements":
+    args = checked_arguments(tool, value["arguments"], body=body)
+    if not query and tool == "create_requirement" and receipts and receipts[-1].get("tool_id") == "search_requirements":
         for record in receipts[-1]["result"]["items"]:
             if record["title"].casefold() == args["title"].casefold():
                 raise InvalidDecision("刚才的检索已找到同名需求 " + record["id"] + "。请引用回执或按用户目标选择其他操作")
@@ -172,17 +233,30 @@ def decision(body, raw, receipts):
     return {"id": tool, "arguments": args}
 
 
-def arguments(tool_id, raw):
+def arguments(tool_id, raw, body=None):
     if len(raw) > 32000:
         raise ValueError("提议超出大小上限")
     try:
         value = json.loads(raw)
     except (ValueError, RecursionError):
         raise ValueError("模型提议须为有效的 JSON 对象") from None
-    return checked_arguments(tool_id, value)
+    return checked_arguments(tool_id, value, body=body)
 
 
-def checked_arguments(tool_id, value):
+def checked_arguments(tool_id, value, body=None):
+    if is_mcp_tool(tool_id):
+        if not isinstance(value, dict):
+            raise ValueError("MCP 工具参数须为 JSON 对象")
+        raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if len(raw.encode("utf-8")) > 32000:
+            raise ValueError("MCP 工具参数超过大小上限")
+        meta = (body or {}).get("mcp_tools", {}).get(tool_id, {})
+        required = meta.get("parameters", {}).get("required", [])
+        if isinstance(required, list):
+            for key in required:
+                if key not in value:
+                    raise ValueError(f"MCP 工具缺少必填参数 {key}")
+        return value
     fields = {"query": 160} if tool_id != "create_requirement" else {
         "title": 160, "description": 4000, "priority": 6,
     }

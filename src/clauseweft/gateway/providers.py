@@ -1,5 +1,7 @@
 """Upstream chat transports (one-shot and SSE streaming) for configured models."""
 
+import base64
+import binascii
 import http.client
 import json
 import os
@@ -7,13 +9,15 @@ import re
 import socket
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from .config import Config, Endpoint
 from .errors import GatewayError
 
 _TOOL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}")
+_DATA_IMAGE_URI = re.compile(r"^data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=\s]+)$")
+_MAX_IMAGE_BYTES = 2 * 1024 * 1024
 
 
 def _bad_response():
@@ -25,6 +29,50 @@ def _check_utf8(value, message):
         value.encode("utf-8")
     except UnicodeEncodeError:
         raise GatewayError(400, "invalid_messages", message) from None
+
+
+def _parse_data_image_url(url):
+    if not isinstance(url, str) or not url.isascii():
+        raise GatewayError(400, "invalid_messages", "图片 URL 格式无效")
+    matched = _DATA_IMAGE_URI.fullmatch(url.strip())
+    if not matched:
+        raise GatewayError(400, "invalid_messages", "图片仅支持受控的 base64 data URI，拒绝外部 URL")
+    media_type, encoded = matched.group(1), re.sub(r"\s+", "", matched.group(2))
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise GatewayError(400, "invalid_messages", "图片 base64 内容无效") from None
+    if not 1 <= len(raw) <= _MAX_IMAGE_BYTES:
+        raise GatewayError(400, "invalid_messages", "单张图片解码大小须在 1 B 至 2 MiB 之间")
+    return media_type, encoded
+
+
+def _validate_user_parts(parts):
+    if not 1 <= len(parts) <= 8:
+        raise GatewayError(400, "invalid_messages", "多模态消息内容须包含 1 到 8 个片段")
+    text_count = 0
+    image_count = 0
+    for part in parts:
+        if not isinstance(part, dict) or not isinstance(part.get("type"), str):
+            raise GatewayError(400, "invalid_messages", "多模态片段格式无效")
+        ptype = part["type"]
+        if ptype == "text":
+            if set(part) != {"type", "text"} or not isinstance(part["text"], str) or not part["text"].strip():
+                raise GatewayError(400, "invalid_messages", "多模态文本片段须包含非空 text")
+            _check_utf8(part["text"], "消息包含无效的 Unicode 文本")
+            text_count += 1
+        elif ptype == "image_url":
+            img = part.get("image_url")
+            if set(part) != {"type", "image_url"} or not isinstance(img, dict) or set(img) != {"url"}:
+                raise GatewayError(400, "invalid_messages", "image_url 片段仅支持 url 字段")
+            _parse_data_image_url(img["url"])
+            image_count += 1
+            if image_count > 4:
+                raise GatewayError(400, "invalid_messages", "单条消息最多包含 4 张图片")
+        else:
+            raise GatewayError(400, "invalid_messages", "不支持的多模态片段类型")
+    if text_count < 1:
+        raise GatewayError(400, "invalid_messages", "多模态消息至少需要一个非空文本片段")
 
 
 def validate_tools(tools, tool_choice=None):
@@ -97,10 +145,20 @@ def validate_messages(messages, *, allow_tools=False):
         if not isinstance(msg, dict) or not isinstance(msg.get("role"), str):
             raise GatewayError(400, "invalid_messages", "消息格式无效")
         role = msg["role"]
-        if role in ("system", "user"):
+        if role == "system":
             if set(msg) != {"role", "content"} or not isinstance(msg["content"], str) or not msg["content"].strip():
                 raise GatewayError(400, "invalid_messages", "消息应仅包含受支持的 role 与非空文本 content")
             _check_utf8(msg["content"], "消息包含无效的 Unicode 文本")
+        elif role == "user":
+            if set(msg) != {"role", "content"}:
+                raise GatewayError(400, "invalid_messages", "消息应仅包含受支持的 role 与 content")
+            content = msg["content"]
+            if isinstance(content, list):
+                _validate_user_parts(content)
+            elif isinstance(content, str) and content.strip():
+                _check_utf8(content, "消息包含无效的 Unicode 文本")
+            else:
+                raise GatewayError(400, "invalid_messages", "消息应仅包含受支持的 role 与非空文本或多模态 content")
         elif role == "assistant":
             keys = set(msg)
             if keys == {"role", "content"}:
@@ -136,6 +194,19 @@ def validate_messages(messages, *, allow_tools=False):
             raise GatewayError(400, "invalid_messages", "消息包含不支持的角色")
 
 
+def _safe_json_obj(raw):
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            pass
+    return {}
+
+
 def _ollama_messages(messages):
     converted = []
     for msg in messages:
@@ -144,16 +215,192 @@ def _ollama_messages(messages):
         elif msg["role"] == "assistant" and "tool_calls" in msg:
             calls = []
             for call in msg["tool_calls"]:
-                raw_args = call["function"]["arguments"]
-                try:
-                    parsed = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                except ValueError:
-                    parsed = {}
-                calls.append({"function": {"name": call["function"]["name"], "arguments": parsed}})
+                calls.append({
+                    "function": {
+                        "name": call["function"]["name"],
+                        "arguments": _safe_json_obj(call["function"]["arguments"]),
+                    }
+                })
             converted.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
+        elif msg["role"] == "user" and isinstance(msg["content"], list):
+            texts = []
+            images = []
+            for part in msg["content"]:
+                if part["type"] == "text":
+                    texts.append(part["text"])
+                elif part["type"] == "image_url":
+                    _, encoded = _parse_data_image_url(part["image_url"]["url"])
+                    images.append(encoded)
+            entry = {"role": "user", "content": "\n".join(texts)}
+            if images:
+                entry["images"] = images
+            converted.append(entry)
         else:
             converted.append(msg)
     return converted
+
+
+def _anthropic_payload(endpoint, messages, max_tokens, *, tools, tool_choice, stream):
+    system_parts = []
+    conv = []
+    for msg in messages:
+        role = msg["role"]
+        if role == "system":
+            system_parts.append(msg["content"])
+        elif role == "user":
+            if isinstance(msg["content"], list):
+                blocks = []
+                for part in msg["content"]:
+                    if part["type"] == "text":
+                        blocks.append({"type": "text", "text": part["text"]})
+                    elif part["type"] == "image_url":
+                        media_type, encoded = _parse_data_image_url(part["image_url"]["url"])
+                        blocks.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type, "data": encoded},
+                        })
+                conv.append({"role": "user", "content": blocks})
+            else:
+                conv.append({"role": "user", "content": msg["content"]})
+        elif role == "assistant":
+            if "tool_calls" in msg:
+                blocks = []
+                if msg.get("content"):
+                    blocks.append({"type": "text", "text": msg["content"]})
+                for call in msg["tool_calls"]:
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": call["id"],
+                        "name": call["function"]["name"],
+                        "input": _safe_json_obj(call["function"]["arguments"]),
+                    })
+                conv.append({"role": "assistant", "content": blocks})
+            else:
+                conv.append({"role": "assistant", "content": msg["content"]})
+        elif role == "tool":
+            block = {
+                "type": "tool_result",
+                "tool_use_id": msg["tool_call_id"],
+                "content": msg["content"],
+            }
+            if (conv and conv[-1]["role"] == "user" and isinstance(conv[-1]["content"], list)
+                    and all(b.get("type") == "tool_result" for b in conv[-1]["content"])):
+                conv[-1]["content"].append(block)
+            else:
+                conv.append({"role": "user", "content": [block]})
+    if not conv:
+        raise GatewayError(400, "invalid_messages", "Anthropic 协议至少需要一条非 system 消息")
+    body = {
+        "model": endpoint.model,
+        "max_tokens": max_tokens,
+        "messages": conv,
+        "stream": bool(stream),
+    }
+    if system_parts:
+        body["system"] = "\n\n".join(system_parts)
+    if tools is not None:
+        body["tools"] = [
+            {
+                "name": item["function"]["name"],
+                **({"description": item["function"]["description"]} if "description" in item["function"] else {}),
+                "input_schema": item["function"].get("parameters", {"type": "object", "properties": {}}),
+            }
+            for item in tools
+        ]
+        if tool_choice is not None:
+            if tool_choice == "auto":
+                body["tool_choice"] = {"type": "auto"}
+            elif tool_choice == "required":
+                body["tool_choice"] = {"type": "any"}
+            elif tool_choice == "none":
+                body["tool_choice"] = {"type": "none"}
+            elif isinstance(tool_choice, dict):
+                body["tool_choice"] = {"type": "tool", "name": tool_choice["function"]["name"]}
+    return body
+
+
+def _gemini_payload(endpoint, messages, max_tokens, *, json_decision, tools, tool_choice, response_format):
+    system_parts = []
+    contents = []
+    call_names = {}
+    for msg in messages:
+        role = msg["role"]
+        if role == "system":
+            system_parts.append(msg["content"])
+        elif role == "user":
+            if isinstance(msg["content"], list):
+                parts = []
+                for part in msg["content"]:
+                    if part["type"] == "text":
+                        parts.append({"text": part["text"]})
+                    elif part["type"] == "image_url":
+                        media_type, encoded = _parse_data_image_url(part["image_url"]["url"])
+                        parts.append({"inlineData": {"mimeType": media_type, "data": encoded}})
+                contents.append({"role": "user", "parts": parts})
+            else:
+                contents.append({"role": "user", "parts": [{"text": msg["content"]}]})
+        elif role == "assistant":
+            parts = []
+            if msg.get("content"):
+                parts.append({"text": msg["content"]})
+            for call in msg.get("tool_calls", []):
+                call_names[call["id"]] = call["function"]["name"]
+                parts.append({
+                    "functionCall": {
+                        "name": call["function"]["name"],
+                        "args": _safe_json_obj(call["function"]["arguments"]),
+                    }
+                })
+            contents.append({"role": "model", "parts": parts})
+        elif role == "tool":
+            fn_name = call_names.get(msg["tool_call_id"], msg["tool_call_id"])
+            part = {"functionResponse": {"name": fn_name, "response": {"content": msg["content"]}}}
+            if (contents and contents[-1]["role"] == "user"
+                    and all("functionResponse" in p for p in contents[-1]["parts"])):
+                contents[-1]["parts"].append(part)
+            else:
+                contents.append({"role": "user", "parts": [part]})
+    if not contents:
+        raise GatewayError(400, "invalid_messages", "Gemini 协议至少需要一条非 system 消息")
+    gen_config = {"maxOutputTokens": max_tokens}
+    if response_format is not None:
+        if response_format["type"] == "json_object":
+            gen_config["responseMimeType"] = "application/json"
+        elif response_format["type"] == "json_schema":
+            gen_config["responseMimeType"] = "application/json"
+            gen_config["responseSchema"] = response_format["json_schema"]["schema"]
+    elif json_decision:
+        gen_config["responseMimeType"] = "application/json"
+        gen_config["temperature"] = 0
+    body = {"contents": contents, "generationConfig": gen_config}
+    if system_parts:
+        body["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
+    if tools is not None:
+        body["tools"] = [{
+            "functionDeclarations": [
+                {
+                    "name": item["function"]["name"],
+                    **({"description": item["function"]["description"]} if "description" in item["function"] else {}),
+                    **({"parameters": item["function"]["parameters"]} if "parameters" in item["function"] else {}),
+                }
+                for item in tools
+            ]
+        }]
+        if tool_choice is not None:
+            if tool_choice == "auto":
+                body["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+            elif tool_choice == "none":
+                body["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
+            elif tool_choice == "required":
+                body["toolConfig"] = {"functionCallingConfig": {"mode": "ANY"}}
+            elif isinstance(tool_choice, dict):
+                body["toolConfig"] = {
+                    "functionCallingConfig": {
+                        "mode": "ANY",
+                        "allowedFunctionNames": [tool_choice["function"]["name"]],
+                    }
+                }
+    return body
 
 
 def _payload(endpoint, messages, max_tokens, request_id, json_decision=False, *,
@@ -165,13 +412,20 @@ def _payload(endpoint, messages, max_tokens, request_id, json_decision=False, *,
     validate_messages(messages, allow_tools=bool(tools))
     tools, tool_choice = validate_tools(tools, tool_choice)
     response_format = validate_response_format(response_format)
-    body = {
-        "model": endpoint.model,
-        "messages": _ollama_messages(messages) if endpoint.protocol == "ollama" else messages,
-        "stream": bool(stream),
-    }
-    if endpoint.protocol == "ollama":
-        body["options"] = {"num_predict": max_tokens}
+    if endpoint.protocol == "anthropic":
+        body = _anthropic_payload(endpoint, messages, max_tokens,
+                                  tools=tools, tool_choice=tool_choice, stream=stream)
+    elif endpoint.protocol == "gemini":
+        body = _gemini_payload(endpoint, messages, max_tokens,
+                               json_decision=json_decision, tools=tools,
+                               tool_choice=tool_choice, response_format=response_format)
+    elif endpoint.protocol == "ollama":
+        body = {
+            "model": endpoint.model,
+            "messages": _ollama_messages(messages),
+            "stream": bool(stream),
+            "options": {"num_predict": max_tokens},
+        }
         if response_format is not None:
             if response_format["type"] == "json_object":
                 body["format"] = "json"
@@ -183,7 +437,12 @@ def _payload(endpoint, messages, max_tokens, request_id, json_decision=False, *,
         if tools is not None:
             body["tools"] = tools
     else:
-        body["max_tokens"] = max_tokens
+        body = {
+            "model": endpoint.model,
+            "messages": messages,
+            "stream": bool(stream),
+            "max_tokens": max_tokens,
+        }
         if stream:
             body["stream_options"] = {"include_usage": True}
         if tools is not None:
@@ -198,17 +457,37 @@ def _payload(endpoint, messages, max_tokens, request_id, json_decision=False, *,
         raise GatewayError(400, "invalid_messages", "消息包含无效的 Unicode 字符") from None
 
 
+def _upstream_suffix(endpoint, *, stream=False):
+    if endpoint.protocol == "ollama":
+        return "/api/chat"
+    if endpoint.protocol == "anthropic":
+        return "/messages"
+    if endpoint.protocol == "gemini":
+        model_seg = quote(endpoint.model, safe="._-")
+        action = "streamGenerateContent?alt=sse" if stream else "generateContent"
+        return f"/models/{model_seg}:{action}"
+    return "/chat/completions"
+
+
 def _headers(endpoint, request_id, *, stream=False):
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream" if stream and endpoint.protocol != "ollama" else "application/json",
-        "X-Request-ID": request_id, "Connection": "close",
+        "X-Request-ID": request_id,
+        "Connection": "close",
     }
+    if endpoint.protocol == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
     if endpoint.api_key_env:
         key = os.environ.get(endpoint.api_key_env, "")
         if not key or len(key) > 8192 or not all(33 <= ord(c) <= 126 for c in key):
             raise GatewayError(503, "upstream_credentials_unavailable", "上游凭据未就绪")
-        headers["Authorization"] = f"Bearer {key}"
+        if endpoint.protocol == "anthropic":
+            headers["x-api-key"] = key
+        elif endpoint.protocol == "gemini":
+            headers["x-goog-api-key"] = key
+        else:
+            headers["Authorization"] = f"Bearer {key}"
     return headers
 
 
@@ -251,7 +530,7 @@ def _post(config, endpoint, body, headers):
     url = urlsplit(endpoint.base_url)
     connection_type = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
     connection = connection_type(url.hostname, url.port, timeout=config.timeout_seconds)
-    suffix = "/api/chat" if endpoint.protocol == "ollama" else "/chat/completions"
+    suffix = _upstream_suffix(endpoint, stream=False)
     deadline = time.monotonic() + config.timeout_seconds
     timer = None
     expired = threading.Event()
@@ -316,7 +595,60 @@ def _extract_usage(counts):
                   cached=cached, reasoning=reasoning)
 
 
-def _normalize_tool_calls(raw_calls, *, is_ollama=False):
+def _anthropic_usage(inp, out, cache_read=None, cache_create=None):
+    if type(inp) is not int or type(out) is not int or inp < 0 or out < 0:
+        return None
+    read_tok = cache_read if type(cache_read) is int and cache_read >= 0 else 0
+    create_tok = cache_create if type(cache_create) is int and cache_create >= 0 else 0
+    prompt = inp + read_tok + create_tok
+    return _usage(
+        prompt, out, prompt + out,
+        cached=cache_read if type(cache_read) is int and cache_read >= 0 else None,
+    )
+
+
+def _gemini_usage(meta):
+    if not isinstance(meta, dict):
+        return None
+    prompt = meta.get("promptTokenCount")
+    cand = meta.get("candidatesTokenCount", 0) if prompt is not None else None
+    if type(prompt) is not int or type(cand) is not int or prompt < 0 or cand < 0:
+        return None
+    thoughts = meta.get("thoughtsTokenCount")
+    cached = meta.get("cachedContentTokenCount")
+    extra_thoughts = thoughts if type(thoughts) is int and thoughts > 0 else 0
+    comp = cand + extra_thoughts
+    raw_total = meta.get("totalTokenCount")
+    if type(raw_total) is int and raw_total == prompt + cand and extra_thoughts == 0:
+        total = raw_total
+    else:
+        total = prompt + comp
+    return _usage(prompt, comp, total, cached=cached, reasoning=thoughts)
+
+
+def _anthropic_reason(stop_reason, has_calls):
+    if stop_reason == "tool_use":
+        return "tool_calls"
+    if stop_reason in ("end_turn", "stop_sequence", None):
+        return "tool_calls" if has_calls else "stop"
+    if stop_reason == "max_tokens":
+        return "length"
+    if stop_reason == "refusal":
+        return "content_filter"
+    return None
+
+
+def _gemini_reason(finish_reason, has_calls):
+    if finish_reason in ("STOP", None):
+        return "tool_calls" if has_calls else "stop"
+    if finish_reason == "MAX_TOKENS":
+        return "length"
+    if finish_reason in ("SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT"):
+        return "content_filter"
+    return None
+
+
+def _normalize_tool_calls(raw_calls, *, allow_dict_args=False):
     if not isinstance(raw_calls, list) or not 1 <= len(raw_calls) <= 32:
         raise _bad_response()
     normalized = []
@@ -328,7 +660,7 @@ def _normalize_tool_calls(raw_calls, *, is_ollama=False):
         if not isinstance(name, str) or not _TOOL_NAME.fullmatch(name):
             raise _bad_response()
         raw_args = fn.get("arguments")
-        if is_ollama and isinstance(raw_args, dict):
+        if allow_dict_args and isinstance(raw_args, dict):
             args_text = json.dumps(raw_args, ensure_ascii=False, separators=(",", ":"))
         elif isinstance(raw_args, str):
             args_text = raw_args
@@ -345,6 +677,66 @@ def _normalize_tool_calls(raw_calls, *, is_ollama=False):
     return normalized
 
 
+def _parse_anthropic_message(response):
+    blocks = response.get("content")
+    if response.get("type") != "message" or not isinstance(blocks, list):
+        raise _bad_response()
+    texts = []
+    calls = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            raise _bad_response()
+        btype = block.get("type")
+        if btype == "text":
+            if not isinstance(block.get("text"), str):
+                raise _bad_response()
+            texts.append(block["text"])
+        elif btype == "tool_use":
+            calls.append({
+                "id": block.get("id"),
+                "function": {"name": block.get("name"), "arguments": block.get("input", {})},
+            })
+    u = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    usage = _anthropic_usage(
+        u.get("input_tokens"), u.get("output_tokens"),
+        u.get("cache_read_input_tokens"), u.get("cache_creation_input_tokens"),
+    )
+    reason = _anthropic_reason(response.get("stop_reason"), bool(calls))
+    msg = {"role": "assistant", "content": "".join(texts)}
+    if calls:
+        msg["tool_calls"] = calls
+    return msg, reason, usage
+
+
+def _parse_gemini_message(response):
+    candidates = response.get("candidates")
+    if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+        raise _bad_response()
+    cand = candidates[0]
+    content_obj = cand.get("content")
+    if not isinstance(content_obj, dict) or not isinstance(content_obj.get("parts"), list):
+        raise _bad_response()
+    texts = []
+    calls = []
+    for part in content_obj["parts"]:
+        if not isinstance(part, dict):
+            raise _bad_response()
+        if isinstance(part.get("text"), str) and not part.get("thought"):
+            texts.append(part["text"])
+        elif isinstance(part.get("functionCall"), dict):
+            fc = part["functionCall"]
+            calls.append({
+                "id": fc.get("id"),
+                "function": {"name": fc.get("name"), "arguments": fc.get("args", {})},
+            })
+    usage = _gemini_usage(response.get("usageMetadata"))
+    reason = _gemini_reason(cand.get("finishReason"), bool(calls))
+    msg = {"role": "assistant", "content": "".join(texts)}
+    if calls:
+        msg["tool_calls"] = calls
+    return msg, reason, usage
+
+
 def _completion(endpoint: Endpoint, response: dict, request_id: str, upstream_request_id: str | None,
                 *, allow_tool_calls: bool = False):
     if endpoint.protocol == "ollama":
@@ -356,6 +748,13 @@ def _completion(endpoint: Endpoint, response: dict, request_id: str, upstream_re
         completion = response.get("eval_count")
         total = prompt + completion if type(prompt) is int and type(completion) is int else None
         usage = _usage(prompt, completion, total)
+        allow_dict_args = True
+    elif endpoint.protocol == "anthropic":
+        message, reason, usage = _parse_anthropic_message(response)
+        allow_dict_args = True
+    elif endpoint.protocol == "gemini":
+        message, reason, usage = _parse_gemini_message(response)
+        allow_dict_args = True
     else:
         choices = response.get("choices")
         if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
@@ -363,6 +762,7 @@ def _completion(endpoint: Endpoint, response: dict, request_id: str, upstream_re
         message = choices[0].get("message")
         reason = choices[0].get("finish_reason")
         usage = _extract_usage(response.get("usage"))
+        allow_dict_args = False
     if not isinstance(message, dict) or message.get("role") != "assistant":
         raise _bad_response()
     raw_calls = message.get("tool_calls")
@@ -370,7 +770,7 @@ def _completion(endpoint: Endpoint, response: dict, request_id: str, upstream_re
     if has_calls and not allow_tool_calls:
         raise _bad_response()
     if has_calls:
-        tool_calls = _normalize_tool_calls(raw_calls, is_ollama=endpoint.protocol == "ollama")
+        tool_calls = _normalize_tool_calls(raw_calls, allow_dict_args=allow_dict_args)
         if endpoint.protocol == "ollama" and reason == "stop":
             reason = "tool_calls"
     else:
@@ -399,10 +799,16 @@ def _completion(endpoint: Endpoint, response: dict, request_id: str, upstream_re
     }
     if usage is not None:
         result["usage"] = usage
+    upstream_model = response.get("model") or response.get("modelVersion")
+    upstream_cid = (
+        response.get("id") if endpoint.protocol in ("chat_completions", "anthropic")
+        else response.get("responseId") if endpoint.protocol == "gemini"
+        else None
+    )
     identifiers = {
-        "upstream_model": response.get("model"),
+        "upstream_model": upstream_model,
         "upstream_request_id": upstream_request_id,
-        "upstream_completion_id": response.get("id") if endpoint.protocol == "chat_completions" else None,
+        "upstream_completion_id": upstream_cid,
     }
     metadata = {
         key: value for key, value in identifiers.items()
@@ -440,7 +846,7 @@ def invoke_stream(config: Config, endpoint_id: str, messages: list, max_tokens: 
     url = urlsplit(endpoint.base_url)
     connection_type = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
     connection = connection_type(url.hostname, url.port, timeout=config.timeout_seconds)
-    suffix = "/api/chat" if endpoint.protocol == "ollama" else "/chat/completions"
+    suffix = _upstream_suffix(endpoint, stream=True)
     deadline = time.monotonic() + config.timeout_seconds
     expired = threading.Event()
     timer = None
@@ -484,6 +890,11 @@ def invoke_stream(config: Config, endpoint_id: str, messages: list, max_tokens: 
         created = int(time.time())
         chunk_id = f"chatcmpl-{request_id}"
         seen_bytes = 0
+        anth_in = None
+        anth_cache_read = None
+        anth_cache_create = None
+        anth_tool_idx = -1
+        anth_has_calls = False
         try:
             with response:
                 while True:
@@ -505,7 +916,7 @@ def invoke_stream(config: Config, endpoint_id: str, messages: list, max_tokens: 
                         if isinstance(msg.get("content"), str) and msg["content"]:
                             delta["content"] = msg["content"]
                         if tools and msg.get("tool_calls"):
-                            delta["tool_calls"] = _normalize_tool_calls(msg["tool_calls"], is_ollama=True)
+                            delta["tool_calls"] = _normalize_tool_calls(msg["tool_calls"], allow_dict_args=True)
                         done = item.get("done") is True
                         reason = None
                         usage = None
@@ -526,6 +937,128 @@ def invoke_stream(config: Config, endpoint_id: str, messages: list, max_tokens: 
                             yield out
                         if done:
                             break
+                    elif endpoint.protocol == "anthropic":
+                        if not text.startswith("data:"):
+                            continue
+                        payload = text[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        item = json.loads(payload)
+                        if not isinstance(item, dict) or item.get("type") == "error":
+                            break
+                        etype = item.get("type")
+                        if etype == "message_start":
+                            msg_u = (item.get("message") or {}).get("usage") or {}
+                            anth_in = msg_u.get("input_tokens")
+                            anth_cache_read = msg_u.get("cache_read_input_tokens")
+                            anth_cache_create = msg_u.get("cache_creation_input_tokens")
+                            yield {
+                                "id": chunk_id, "object": "chat.completion.chunk", "created": created,
+                                "model": endpoint.id,
+                                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                            }
+                        elif etype == "content_block_start":
+                            cb = item.get("content_block") or {}
+                            if tools and cb.get("type") == "tool_use":
+                                anth_tool_idx += 1
+                                anth_has_calls = True
+                                yield {
+                                    "id": chunk_id, "object": "chat.completion.chunk", "created": created,
+                                    "model": endpoint.id,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"tool_calls": [{
+                                            "index": anth_tool_idx,
+                                            "id": cb.get("id") or f"call_{anth_tool_idx}",
+                                            "type": "function",
+                                            "function": {"name": cb.get("name", ""), "arguments": ""},
+                                        }]},
+                                        "finish_reason": None,
+                                    }],
+                                }
+                        elif etype == "content_block_delta":
+                            d = item.get("delta") or {}
+                            if d.get("type") == "text_delta" and isinstance(d.get("text"), str) and d["text"]:
+                                yield {
+                                    "id": chunk_id, "object": "chat.completion.chunk", "created": created,
+                                    "model": endpoint.id,
+                                    "choices": [{"index": 0, "delta": {"content": d["text"]}, "finish_reason": None}],
+                                }
+                            elif (tools and d.get("type") == "input_json_delta"
+                                  and isinstance(d.get("partial_json"), str)):
+                                yield {
+                                    "id": chunk_id, "object": "chat.completion.chunk", "created": created,
+                                    "model": endpoint.id,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"tool_calls": [{
+                                            "index": max(0, anth_tool_idx),
+                                            "function": {"arguments": d["partial_json"]},
+                                        }]},
+                                        "finish_reason": None,
+                                    }],
+                                }
+                        elif etype == "message_delta":
+                            stop_reason = (item.get("delta") or {}).get("stop_reason")
+                            reason = _anthropic_reason(stop_reason, anth_has_calls) or "stop"
+                            out_u = item.get("usage") or {}
+                            usage = _anthropic_usage(
+                                anth_in, out_u.get("output_tokens"), anth_cache_read, anth_cache_create,
+                            )
+                            out = {
+                                "id": chunk_id, "object": "chat.completion.chunk", "created": created,
+                                "model": endpoint.id,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
+                            }
+                            if usage is not None:
+                                out["usage"] = usage
+                            yield out
+                        elif etype == "message_stop":
+                            break
+                    elif endpoint.protocol == "gemini":
+                        if not text.startswith("data:"):
+                            continue
+                        payload = text[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        item = json.loads(payload)
+                        if not isinstance(item, dict) or "error" in item:
+                            break
+                        candidates = item.get("candidates") or []
+                        delta = {}
+                        reason = None
+                        if candidates and isinstance(candidates[0], dict):
+                            cand = candidates[0]
+                            parts = ((cand.get("content") or {}).get("parts")) or []
+                            texts = []
+                            raw_calls = []
+                            for p in parts:
+                                if not isinstance(p, dict):
+                                    continue
+                                if isinstance(p.get("text"), str) and not p.get("thought") and p["text"]:
+                                    texts.append(p["text"])
+                                elif tools and isinstance(p.get("functionCall"), dict):
+                                    fc = p["functionCall"]
+                                    raw_calls.append({
+                                        "id": fc.get("id"),
+                                        "function": {"name": fc.get("name"), "arguments": fc.get("args", {})},
+                                    })
+                            if texts:
+                                delta["content"] = "".join(texts)
+                            if raw_calls:
+                                delta["tool_calls"] = _normalize_tool_calls(raw_calls, allow_dict_args=True)
+                            if cand.get("finishReason"):
+                                reason = _gemini_reason(cand.get("finishReason"), bool(raw_calls))
+                        usage = _gemini_usage(item.get("usageMetadata"))
+                        if delta or reason is not None or usage is not None:
+                            out = {
+                                "id": chunk_id, "object": "chat.completion.chunk", "created": created,
+                                "model": endpoint.id,
+                                "choices": [{"index": 0, "delta": delta, "finish_reason": reason}],
+                            }
+                            if usage is not None:
+                                out["usage"] = usage
+                            yield out
                     else:
                         if not text.startswith("data:"):
                             continue

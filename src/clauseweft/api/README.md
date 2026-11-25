@@ -26,7 +26,7 @@ PYTHONPATH=src python3.11 -m clauseweft serve --config examples/workbench.json -
 
 以下字段用于 `POST /api/v1/routing/previews` 和 `POST /api/v1/runs`。两者都接收 `task.text`，由 `project_id` 确定工作空间，传入 `workspace_id` 时必须匹配。
 
-可传 `task.materials` 引用文本材料，数组每项含 `name` 和 `text`。最多 4 份，正文合计最多 64 KiB，以 UTF-8 字节计。模型请求、路由估价及请求证据均使用实际材料内容。
+可传 `task.materials` 引用文本材料（最多 4 份，合计 64 KiB UTF-8 文本），也可传 `task.attachments` 附带最多 4 张受控 Base64 图片（`image/png`、`image/jpeg`、`image/webp`、`image/gif`，单张 ≤ 2 MiB，合计 ≤ 4 MiB；携带图片时服务端自动附加 `vision` 能力约束过滤选模）。传 `use_project_memory: true` 或 `memory_ids` 可将本项目的结构化长期记忆快照注入本次运行，记忆为 `local_only` 时自动将任务收紧为仅本地处理。
 
 | 任务方式 | 请求字段 | 可观察的结果 |
 |---|---|---|
@@ -89,7 +89,7 @@ PYTHONPATH=src python3.11 -m clauseweft serve --config examples/workbench.json -
 
 角色配置包含名称、阶段、提示和可选固定端点。SOP 模板保存节点、依赖、角色和人工审批节点，保存与发布是两个动作。发布时校验依赖图并冻结角色指令、端点和角色版本。启动时通过 `template_id` 选择最新已发布版本，正在执行的运行保留创建时的快照。更改角色后，需要保存模板的新版本再发布。
 
-通用 SOP 的 `execution_mode` 为 `sop`，支持 `model` 与 `gate` 节点。节点字段为 `node_id`、`label`、`kind`、`stage`、`dependencies` 和可选 `role_id`、`group`。同组的独立模型节点读取相同上游，派发仍受模型身份、数据范围和费用约束。标准研发交付模板使用 `execution_mode=workflow`，审批、补丁整合和实测的必需依赖由服务端保留。
+通用 SOP 的 `execution_mode` 为 `sop`，支持 `model`、`agent`（绑定已登记外部 Agent `runner_id`、`repo_id` 与可选 `base_sha`，在隔离容器中执行代码修改或只读检查并将补丁产物传给下游）与 `gate` 节点。节点字段为 `node_id`、`label`、`kind`、`stage`、`dependencies` 和可选 `role_id`、`group`、`runner_id`、`repo_id`、`base_sha`。同组的独立模型节点读取相同上游，派发仍受模型身份、数据范围和费用约束。标准研发交付模板使用 `execution_mode=workflow`，审批、补丁整合和实测的必需依赖由服务端保留。
 
 总览页的数据来自持久运行、节点、端点和账本，待审批列表直接对应 `needs_input` 状态的人工节点。项目筛选会作用于运行数量、费用、审批和近期运行。
 
@@ -163,7 +163,7 @@ PYTHONPATH=src python3.11 -m clauseweft serve --config examples/workbench.json -
 | 模型用量 | `GET usage` 接受 `workspace_id` 和可选 `project_id`，仅管理员与操作者。返回按模型版本的 `models` 及分币种 `totals`，含实际调用、token、价目、已结算、预留与待核对数量 |
 | 平台总览 | `GET overview` 按 `workspace_id,project_id` 返回获授权范围的项目、运行、按币种分组实耗及预留、待审批节点和近期运行。管理计数与近期审计仅管理员 |
 | 工作空间 | `GET/POST workspaces`，`GET/PATCH workspaces/{id}`。读取按授权过滤，维护仅管理员。字段包括名称、说明及允许的 `repository_ids,endpoint_ids` |
-| 项目 | `GET/POST projects`，`GET/PATCH projects/{id}`。字段为 `name,description,repository_id,status,color`。`status` 为 `active/archived` |
+| 项目 | `GET/POST projects`，`GET/PATCH projects/{id}`。字段为 `name,description,repository_id,status,color`。`status` 为 `active/archived`。子资源 `GET/POST projects/{id}/memories` 与 `PATCH projects/{id}/memories/{mid}`（带 `If-Match`）维护项目级结构化长期记忆（`convention/glossary/decision/lesson`） |
 | 需求中心 | `GET/POST requirements`，`GET/PATCH requirements/{id}`。字段为 `title,description,project_id,status,priority,assignee`。状态为 `backlog/ready/in_progress/review/done`，优先级为 `low/medium/high` |
 | 角色 | `GET/POST roles`，`GET/PATCH roles/{id}`。字段包括 `name,description,stage,prompt,endpoint_id,skill_ids`，空端点表示可在运行时选模 |
 | SOP 模板 | `GET/POST templates`，`GET/PATCH templates/{id}`，`POST templates/{id}/publish`。字段为 `name,description,execution_mode,nodes`。发布需模板当前 `If-Match`。`GET templates/{id}/versions` 返回已发布版本、发布时间、发布者、节点数和冻结节点快照 |
@@ -243,4 +243,4 @@ PYTHONPATH=src python3.11 -m clauseweft audit --input audit-export.json
 
 工具任务完成后提供 `followup`。新任务执行单次文本回答。服务端从原任务读取最终答复和已批准工具回执，将回执中的结果一并发给模型，并在对话轮次的 `receipt_refs` 保存原工件引用。涉及项目资料源的追问在派发时重新验证资料版本，继续执行该来源的数据范围策略。
 
-详情中的 `conversation` 给出来源 ID、版本、已保留的轮次与答复工件引用。历史按最近问答保留至多 8 轮、24 KiB 正文。最新一轮本身超过上限时使用带标记的首尾节选，较早轮次超出剩余额度时按整轮省略。完整输入和答复仍可从来源任务查看。
+详情中的 `conversation` 给出来源 ID、版本、已保留的轮次与答复工件引用。历史按最近问答保留至多 8 轮、24 KiB 正文。最新一轮本身超过上限时使用带标记的首尾节选；较早轮次超出上限被移出滑动窗口时，服务端自动生成至多 4 KiB 的可审计摘要（`conversation_compaction`，记录 `compacted_turns`、`source_run_ids` 与 `source_answer_refs`）注入后续上下文，避免早轮关键结论丢失。完整输入和答复仍可从来源任务查看。

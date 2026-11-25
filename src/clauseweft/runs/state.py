@@ -91,10 +91,13 @@ def describe_run(db, run_id):
                     else (item["node_id"] if item["kind"] == "gate" else "resume"),
                 }
             )
+    compaction = body.get("conversation", {}).get("compaction")
     return dict(
         run_id=run_id,
         **({k: body[k] for k in ("tool_id", "allowed_tools", "max_tool_steps", "requirement_query",
-                                  "reference_digest", "tool_approval_policy", "max_fix_rounds") if k in body}),
+                                  "reference_digest", "tool_approval_policy", "max_fix_rounds",
+                                  "mcp_tools", "mcp_digests", "memory_snapshots") if k in body}),
+        **({"conversation_compaction": compaction} if compaction else {}),
         title=body.get("title") or body["task"]["text"].splitlines()[0][:120],
         project_id=body.get("project_id", "default"),
         requirement_id=body.get("requirement_id"),

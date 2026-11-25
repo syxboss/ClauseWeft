@@ -3,33 +3,32 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark light">
-<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f1f5f6">
-<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#10151d">
-<meta name="description" content="ClauseWeft 个人 AI 工作台">
-<title>ClauseWeft · 研发工作台</title>
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f8fa">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0d0f12">
+<meta name="description" content="ClauseWeft · 可控 AI Agent 编排与软件工程工作台">
+<title>ClauseWeft · AI Agent 工作台</title>
 <style>$style</style>
 </head>
 <body>
 <a class="skip" href="#content">跳至内容</a>
 <main id="access" class="entry">
   <div class="entry-layout">
-    <section class="entry-print">
+    <header class="entry-brand">
       <div class="wordmark">$wordmark</div>
-      <h2>个人 AI 工作台</h2>
-      <canvas class="signal-field" aria-hidden="true" width="1100" height="680"></canvas>
-    </section>
+      <p class="entry-tagline">本地优先 · 可控 AI Agent 编排与软件工程工作台</p>
+    </header>
     <section class="entry-login">
       <h1>连接工作台</h1>
-      <p class="entry-intro">首次使用，请输入启动时取得的本机访问令牌。</p>
+      <p class="entry-intro">首次使用，请输入启动时显示的本机访问令牌。</p>
       <div class="entry-tabs" id="login-tabs" role="group" aria-label="登录方式"><button type="button" class="active" aria-pressed="true" data-action="login-mode" data-id="pair">个人配对</button><button type="button" aria-pressed="false" data-action="login-mode" data-id="account">已有账号</button><button type="button" aria-pressed="false" data-action="login-mode" data-id="token">管理员</button></div>
       <form id="login">
         <div id="account-fields" hidden><label>用户名<input id="username" name="username" autocomplete="username"></label><label>密码<input type="password" id="password" name="password" autocomplete="current-password"></label></div>
         <div id="token-fields"><label>本机访问令牌<input type="password" id="token" name="token" autocomplete="off" required></label></div>
         <p id="login-error" class="form-error" role="alert"></p>
-        <button class="primary full" type="submit">进入工作空间 <span aria-hidden="true">↗</span></button>
+        <button class="primary full" type="submit">进入工作空间</button>
       </form>
-      <p class="entry-help">配对后可在此浏览器使用 12 小时；退出登录可提前结束会话。</p>
+      <p class="entry-help">配对后可在此浏览器使用 12 小时，退出登录即撤销会话。</p>
     </section>
   </div>
 </main>
@@ -52,7 +51,6 @@
   <div class="navigation-band" id="sidebar">
     <div class="navigation-inner">
       <nav id="nav" aria-label="主导航"></nav>
-
     </div>
   </div>
   <div id="notice" class="toast" role="status" aria-live="polite" hidden></div>

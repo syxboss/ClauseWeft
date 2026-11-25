@@ -37,6 +37,7 @@ def claim(store):
         for row in db.execute(
             """SELECT n.*,r.body FROM nodes n JOIN runs r USING(run_id)
                                   WHERE n.state='ready' AND ready_at<=? AND r.status IN ('queued','running')
+                                  AND coalesce(json_extract(n.definition, '$.kind'), 'model') = 'model'
                                   ORDER BY ready_at,r.created,n.rowid""",
             (time.time(),),
         ):

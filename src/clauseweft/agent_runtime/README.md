@@ -2,10 +2,11 @@
 
 工作台从本机可信配置的 `agent_runners` 加载执行器。在任务页选择已登记的执行器、仓库和基准提交。每次运行都会启动新容器。会话 ID 用于核对供应商回执，跨任务评审通过已保存的候选文件和差异交接。
 
-| 执行器 | 任务输入 | 完成条件 |
+| 执行器 (`kind`) | 任务输入与隔离模式 | 完成条件与显式能力 (`CAPABILITIES`) |
 |---|---|---|
-| Claude Code | 目标通过标准输入交给 `claude -p`。筛选过的普通文本文件放在容器内的临时工作目录，Claude 可用 Read、Glob、Grep、Edit、Write。 | 收到成功的 `result` 事件、进程正常退出、输出文件通过校验。工作台据此计算可供检查的 Git 差异。 |
-| DeepSeek Harness | 使用 `dsh --profile headless --json` 的只读模式。收到工具守卫的就绪信号后，适配器才提交任务与文件文本。守卫拒绝模型发起的所有工具调用。 | 收到 `final` 事件，其中 `reason.kind` 为 `completed`，且进程正常退出。 |
+| Claude Code (`claude`) | 目标通过标准输入交给 `claude -p --output-format stream-json`。白名单普通文本快照放入容器临时工作区。 | 收到成功的 `result` 事件、进程正常退出、输出文件通过校验并生成可审阅补丁（`editable=true`）。 |
+| DeepSeek Harness (`deepseek`) | 使用 `dsh --profile headless --json` 只读守卫模式，拒绝模型发起的所有工具写操作。 | 收到 `final`（`reason.kind=completed`）且工作区零改动（`editable=false, read_only_guard=true`）。 |
+| Codex / Gemini / Kimi / OpenCode (`codex`, `gemini`, `kimi`, `opencode`) | 通过统一容器适配器调用对应官方 headless JSON CLI，仅注入对应供应商单个 API Key 环境变量。 | 解析标准化 JSON 事件流与 token 回执，校验白名单文件改动并生成 Git 补丁；同时支持作为通用 SOP 的 `kind="agent"` 节点编排。 |
 
 ## 镜像与凭据
 

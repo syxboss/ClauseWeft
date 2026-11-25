@@ -52,7 +52,17 @@ def _publish_tool_decision(store, db, run_id, current, body, text, raw_artifact)
             "node_id": current["node_id"], "artifact": answer, "response_sha256": raw_artifact,
         })
         return answer
-    gate = workflow.tool_gate(definition["tool_step"], project_tools.TOOLS[decision["id"]][0])
+    if "calls" in decision:
+        names = "、".join(project_tools.tool_label(c["id"], body) for c in decision["calls"])
+        gate = workflow.tool_gate(definition["tool_step"], "并行工具 · " + names)
+        insert_nodes(db, run_id, [gate])
+        store.event(db, run_id, "tool_proposed", {
+            "node_id": gate["node_id"],
+            "tool_ids": [c["id"] for c in decision["calls"]],
+            "proposal_ref": raw_artifact,
+        })
+        return raw_artifact
+    gate = workflow.tool_gate(definition["tool_step"], project_tools.tool_label(decision["id"], body))
     insert_nodes(db, run_id, [gate])
     store.event(db, run_id, "tool_proposed", {
         "node_id": gate["node_id"], "tool_id": decision["id"], "proposal_ref": raw_artifact,

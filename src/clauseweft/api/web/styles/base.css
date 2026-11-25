@@ -89,7 +89,7 @@ h3 {
   font-weight: 600;
 }
 small {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--muted);
 }
 strong {
@@ -327,14 +327,14 @@ tbody tr:hover {
 }
 .title-cell strong {
   display: block;
-  font-size: 12px;
-  font-weight: 500;
+  font-size: 13px;
+  font-weight: 550;
 }
 .title-cell small {
   display: block;
-  margin-top: 4px;
+  margin-top: 3px;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 12px;
 }
 .table-link {
   display: block;
